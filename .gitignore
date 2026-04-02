@@ -1,0 +1,6 @@
+.gemini/
+data/*
+!data/.gitignore
+build/*
+!build/.gitignore
+.DS_Store
