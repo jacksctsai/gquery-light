@@ -9,6 +9,10 @@
 #include "gq/timer.hpp"
 #include "gq/binary_io.hpp"
 
+#ifdef GQUERY_USE_CUDA
+#include "gq/filter_gpu.hpp"
+#endif
+
 void print_metrics(const std::string& mode, const std::string& layout, std::uint64_t file_bytes, std::uint64_t rows, int iterations, double load_ms, double filter_ms_avg, double total_ms, std::uint64_t count, double sum_fare_amount, double parse_mb_per_s) {
     
     std::uint64_t payload_bytes = rows * 2 * sizeof(float);
@@ -35,7 +39,7 @@ void print_metrics(const std::string& mode, const std::string& layout, std::uint
     }
     std::cout << "filter_gb_per_s: " << std::fixed << std::setprecision(4) << filter_gb_per_s << "\n";
 
-    // Machine-readable line
+    // Machine-readable line (CPU-oriented)
     std::cout << "mode=" << mode << ",layout=" << layout << ","
               << "file_bytes=" << file_bytes << ","
               << "payload_bytes=" << payload_bytes << ","
@@ -50,6 +54,48 @@ void print_metrics(const std::string& mode, const std::string& layout, std::uint
               << "load_gb_per_s=" << load_gb_per_s << ","
               << "filter_gb_per_s=" << filter_gb_per_s << "\n";
 }
+
+#ifdef GQUERY_USE_CUDA
+void print_runbin_gpu_metrics(std::uint64_t file_bytes, std::uint64_t rows, int iterations, double load_ms,
+                              const gq::GpuRunMetrics& gpu, double total_ms, std::uint64_t count,
+                              double sum_fare_amount) {
+    const std::uint64_t payload_bytes = rows * 2 * sizeof(float);
+    const double load_seconds = load_ms / 1000.0;
+    const double load_gb_per_s = load_seconds > 0.0 ? (static_cast<double>(file_bytes) / load_seconds / 1e9) : 0.0;
+
+    std::cout << "file_bytes: " << file_bytes << "\n";
+    std::cout << "payload_bytes: " << payload_bytes << "\n";
+    std::cout << "rows: " << rows << "\n";
+    std::cout << "iterations: " << iterations << "\n";
+    std::cout << "load_ms: " << std::fixed << std::setprecision(4) << load_ms << "\n";
+    std::cout << "h2d_ms: " << std::fixed << std::setprecision(4) << gpu.h2d_ms << "\n";
+    std::cout << "kernel_ms: " << std::fixed << std::setprecision(4) << gpu.kernel_ms << "\n";
+    std::cout << "d2h_ms: " << std::fixed << std::setprecision(4) << gpu.d2h_ms << "\n";
+    std::cout << "total_gpu_ms: " << std::fixed << std::setprecision(4) << gpu.total_gpu_ms << "\n";
+    std::cout << "total_ms: " << std::fixed << std::setprecision(4) << total_ms << "\n";
+    std::cout << "effective_h2d_gb_per_s: " << std::fixed << std::setprecision(4) << gpu.effective_h2d_gb_per_s
+              << "\n";
+    std::cout << "load_gb_per_s: " << std::fixed << std::setprecision(4) << load_gb_per_s << "\n";
+    std::cout << "count: " << count << "\n";
+    std::cout << "sum_fare_amount: " << std::fixed << std::setprecision(4) << sum_fare_amount << "\n";
+
+    std::cout << "mode=gpu,layout=soa,"
+              << "file_bytes=" << file_bytes << ","
+              << "payload_bytes=" << payload_bytes << ","
+              << "rows=" << rows << ","
+              << "iterations=" << iterations << ","
+              << "load_ms=" << std::fixed << std::setprecision(4) << load_ms << ","
+              << "h2d_ms=" << gpu.h2d_ms << ","
+              << "kernel_ms=" << gpu.kernel_ms << ","
+              << "d2h_ms=" << gpu.d2h_ms << ","
+              << "total_gpu_ms=" << gpu.total_gpu_ms << ","
+              << "total_ms=" << total_ms << ","
+              << "effective_h2d_gb_per_s=" << gpu.effective_h2d_gb_per_s << ","
+              << "load_gb_per_s=" << load_gb_per_s << ","
+              << "count=" << count << ","
+              << "sum_fare_amount=" << sum_fare_amount << "\n";
+}
+#endif
 
 int main(int argc, char** argv) {
     try {
@@ -85,24 +131,29 @@ int main(int argc, char** argv) {
             int iterations = (argc > 3) ? std::stoi(argv[3]) : 1;
 
             gq::CpuTimer total_timer;
-            
             // Load binary
             gq::CpuTimer load_timer;
             auto bin_result = gq::read_binary(input_bin);
             double load_ms = load_timer.elapsed_ms();
 
-            // Filter
             gq::Result filter_result{};
+#ifdef GQUERY_USE_CUDA
+            gq::GpuRunMetrics gpu_metrics{};
+            filter_result = gq::filter_and_sum_gpu(bin_result.columns, iterations, gpu_metrics);
+            double total_ms = total_timer.elapsed_ms();
+            print_runbin_gpu_metrics(bin_result.file_bytes, bin_result.rows, iterations, load_ms, gpu_metrics, total_ms,
+                                     filter_result.count, filter_result.sum_fare_amount);
+#else
             gq::CpuTimer filter_timer;
             for (int i = 0; i < iterations; ++i) {
                 filter_result = gq::filter_and_sum_soa(bin_result.columns);
             }
             double total_filter_ms = filter_timer.elapsed_ms();
             double avg_filter_ms = total_filter_ms / static_cast<double>(iterations);
-            
             double total_ms = total_timer.elapsed_ms();
-
-            print_metrics("runbin", "soa", bin_result.file_bytes, bin_result.rows, iterations, load_ms, avg_filter_ms, total_ms, filter_result.count, filter_result.sum_fare_amount, 0.0);
+            print_metrics("runbin", "soa", bin_result.file_bytes, bin_result.rows, iterations, load_ms, avg_filter_ms,
+                          total_ms, filter_result.count, filter_result.sum_fare_amount, 0.0);
+#endif
             return 0;
         } else {
             // Default to CSV mode for backward compatibility with previous task

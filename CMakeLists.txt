@@ -25,8 +25,13 @@ set(COMMON_SOURCES
     src/binary_io.cpp
 )
 
+set(GQUERY_SOURCES src/main.cpp ${COMMON_SOURCES})
+if(CUDA_ENABLED)
+    list(APPEND GQUERY_SOURCES src/filter_gpu.cu)
+endif()
+
 # --- Executables ---
-add_executable(gquery src/main.cpp ${COMMON_SOURCES})
+add_executable(gquery ${GQUERY_SOURCES})
 target_include_directories(gquery PRIVATE include)
 
 add_executable(test_smoke tests/test_smoke.cpp ${COMMON_SOURCES})
@@ -42,6 +47,7 @@ else()
 endif()
 
 if(CUDA_ENABLED)
-    set_target_properties(gquery PROPERTIES CUDA_ARCHITECTURES "native")
-    set_target_properties(test_smoke PROPERTIES CUDA_ARCHITECTURES "native")
+    # See README: match GQUERY_CUDA_ARCH to your GPU (e.g. 75 for compute capability 7.5) or use native locally.
+    set(GQUERY_CUDA_ARCH "80" CACHE STRING "CUDA sm_XX (e.g. 75, 80, 89) or native")
+    set_target_properties(gquery PROPERTIES CUDA_ARCHITECTURES "${GQUERY_CUDA_ARCH}")
 endif()

@@ -5,14 +5,19 @@
 
 namespace gq {
 
+struct GpuRunMetrics {
+    double h2d_ms{};
+    double kernel_ms{};
+    double d2h_ms{};
+    double total_gpu_ms{};
+    double effective_h2d_gb_per_s{};
+};
+
 /**
- * @brief Run the filter on the GPU.
- * 
- * @param columns Input data in SoA format.
- * @param iterations Number of times to run the filter (for benchmark).
- * @param filter_ms Output: average time taken for filtering (ms).
- * @return Result 
+ * Loads columns from host, copies to device, runs one thread per row with atomics for
+ * matching rows (same predicate as CPU), copies count/sum back.
+ * Metrics are averaged over `iterations` runs.
  */
-Result filter_and_sum_gpu(const Columns& columns, int iterations, double& filter_ms);
+Result filter_and_sum_gpu(const Columns& columns, int iterations, GpuRunMetrics& metrics);
 
 } // namespace gq
