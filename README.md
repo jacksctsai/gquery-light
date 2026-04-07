@@ -110,6 +110,13 @@ Writes a small header (`uint64_t` row count) followed by raw `float` arrays: `tr
 
 **Without CUDA:** the same predicate runs on the CPU; **`filter_ms (avg)`** is the per-iteration CPU filter time.
 
+### Correctness check (CUDA builds)
+
+After a GPU `runbin`, the program also runs the **CPU filter once** on the same in-memory columns and prints a small comparison:
+
+- **`cpu_count` vs `gpu_count`**: must match **exactly**
+- **`cpu_sum_fare_amount` vs `gpu_sum_fare_amount`**: may differ slightly due to floating-point atomic accumulation order on GPU; the output includes `sum_delta`, `abs_sum_delta`, and the tolerance used.
+
 ### Direct CSV path (CPU)
 
 ```bash

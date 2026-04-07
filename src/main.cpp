@@ -1,6 +1,7 @@
 #include <exception>
 #include <iostream>
 #include <iomanip>
+#include <cmath>
 #include <string>
 #include <filesystem>
 
@@ -95,6 +96,34 @@ void print_runbin_gpu_metrics(std::uint64_t file_bytes, std::uint64_t rows, int 
               << "count=" << count << ","
               << "sum_fare_amount=" << sum_fare_amount << "\n";
 }
+
+void print_cpu_gpu_correctness(const gq::Result& cpu, const gq::Result& gpu) {
+    const std::uint64_t cpu_count = cpu.count;
+    const std::uint64_t gpu_count = gpu.count;
+    const double cpu_sum = cpu.sum_fare_amount;
+    const double gpu_sum = gpu.sum_fare_amount;
+
+    const std::int64_t count_delta = static_cast<std::int64_t>(gpu_count) - static_cast<std::int64_t>(cpu_count);
+    const double sum_delta = gpu_sum - cpu_sum;
+    const double abs_sum_delta = std::abs(sum_delta);
+
+    constexpr double kAbsEps = 1e-9;
+    constexpr double kRelEps = 1e-9;
+    const double sum_tol = kAbsEps + kRelEps * std::max(std::abs(cpu_sum), 1.0);
+    const bool count_ok = (cpu_count == gpu_count);
+    const bool sum_ok = (abs_sum_delta <= sum_tol);
+
+    std::cout << "cpu_count: " << cpu_count << "\n";
+    std::cout << "gpu_count: " << gpu_count << "\n";
+    std::cout << "count_delta: " << count_delta << "\n";
+    std::cout << "cpu_sum_fare_amount: " << std::fixed << std::setprecision(8) << cpu_sum << "\n";
+    std::cout << "gpu_sum_fare_amount: " << std::fixed << std::setprecision(8) << gpu_sum << "\n";
+    std::cout << "sum_delta: " << std::fixed << std::setprecision(12) << sum_delta << "\n";
+    std::cout << "abs_sum_delta: " << std::fixed << std::setprecision(12) << abs_sum_delta << "\n";
+    std::cout << "sum_tol: " << std::fixed << std::setprecision(12) << sum_tol << "\n";
+    std::cout << "correct_count: " << (count_ok ? 1 : 0) << "\n";
+    std::cout << "correct_sum: " << (sum_ok ? 1 : 0) << "\n";
+}
 #endif
 
 int main(int argc, char** argv) {
@@ -143,6 +172,11 @@ int main(int argc, char** argv) {
             double total_ms = total_timer.elapsed_ms();
             print_runbin_gpu_metrics(bin_result.file_bytes, bin_result.rows, iterations, load_ms, gpu_metrics, total_ms,
                                      filter_result.count, filter_result.sum_fare_amount);
+
+            // Correctness check against CPU on the same input. Count must match exactly; sum may differ slightly due to
+            // floating-point atomic accumulation order on GPU.
+            const gq::Result cpu_result = gq::filter_and_sum_soa(bin_result.columns);
+            print_cpu_gpu_correctness(cpu_result, filter_result);
 #else
             gq::CpuTimer filter_timer;
             for (int i = 0; i < iterations; ++i) {
