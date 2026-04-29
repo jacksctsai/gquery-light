@@ -1,12 +1,14 @@
 #include "gq/filter_gpu.hpp"
 
 #include <cuda_runtime.h>
+#include <thrust/execution_policy.h>
+#include <thrust/scan.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 namespace gq {
 
@@ -38,6 +40,16 @@ inline double elapsed_ms(cudaEvent_t start, cudaEvent_t end, const char* what) {
     return static_cast<double>(ms);
 }
 
+inline int compute_blocks(std::size_t items, int threads_per_block, int max_blocks = 4096) {
+    if (items == 0) {
+        return 1;
+    }
+    const std::size_t raw =
+        (items + static_cast<std::size_t>(threads_per_block) - 1U) / static_cast<std::size_t>(threads_per_block);
+    const std::size_t clamped = std::min<std::size_t>(raw, static_cast<std::size_t>(max_blocks));
+    return static_cast<int>(clamped > 0 ? clamped : 1U);
+}
+
 __global__ void filter_rows_atomic_kernel(const float* trip_distance, const float* fare_amount, std::size_t n,
                                           unsigned long long* count, double* sum_fare) {
     const std::size_t tid = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -61,6 +73,78 @@ __global__ void filter_mask_kernel(const float* trip_distance, const float* fare
         const float fa = fare_amount[i];
         mask[i] = (td > 2.5f && fa > 10.0f) ? static_cast<std::uint8_t>(1) : static_cast<std::uint8_t>(0);
     }
+}
+
+__global__ void mask_u8_to_u64_kernel(const std::uint8_t* mask_u8, std::uint64_t* mask_u64, std::size_t n) {
+    const std::size_t tid = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+    for (std::size_t i = tid; i < n; i += stride) {
+        mask_u64[i] = static_cast<std::uint64_t>(mask_u8[i] != 0);
+    }
+}
+
+__global__ void scatter_selected_indices_kernel(const std::uint64_t* mask_u64, const std::uint64_t* offsets,
+                                                std::size_t n, std::uint32_t* selected_indices) {
+    const std::size_t tid = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+    for (std::size_t i = tid; i < n; i += stride) {
+        if (mask_u64[i] != 0) {
+            selected_indices[offsets[i]] = static_cast<std::uint32_t>(i);
+        }
+    }
+}
+
+__global__ void write_selected_count_kernel(const std::uint64_t* mask_u64, const std::uint64_t* offsets, std::size_t n,
+                                            unsigned long long* selected_count) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *selected_count = (n == 0) ? 0ULL : static_cast<unsigned long long>(offsets[n - 1] + mask_u64[n - 1]);
+    }
+}
+
+__global__ void sum_selected_fares_atomic_kernel(const float* fare_amount, const std::uint32_t* selected_indices,
+                                                 const unsigned long long* selected_count, double* sum_fare) {
+    const unsigned long long count = *selected_count;
+    const std::size_t tid = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+    for (std::size_t i = tid; i < static_cast<std::size_t>(count); i += stride) {
+        atomicAdd(sum_fare, static_cast<double>(fare_amount[selected_indices[i]]));
+    }
+}
+
+__global__ void reduce_selected_fares_block_partials_kernel(const float* fare_amount, const std::uint32_t* selected_indices,
+                                                            const unsigned long long* selected_count,
+                                                            double* partial_sums) {
+    extern __shared__ double sdata[];
+    const unsigned long long count = *selected_count;
+    const std::size_t tid = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+
+    double local = 0.0;
+    for (std::size_t i = tid; i < static_cast<std::size_t>(count); i += stride) {
+        local += static_cast<double>(fare_amount[selected_indices[i]]);
+    }
+    sdata[threadIdx.x] = local;
+    __syncthreads();
+
+    for (unsigned int s = static_cast<unsigned int>(blockDim.x / 2); s > 0; s >>= 1U) {
+        if (threadIdx.x < s) {
+            sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        partial_sums[blockIdx.x] = sdata[0];
+    }
+}
+
+__global__ void reduce_partial_sums_kernel(const double* partial_sums, int num_partials, double* out_sum) {
+    const std::size_t tid = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+    double local = 0.0;
+    for (std::size_t i = tid; i < static_cast<std::size_t>(num_partials); i += stride) {
+        local += partial_sums[i];
+    }
+    atomicAdd(out_sum, local);
 }
 
 } // namespace
@@ -167,6 +251,7 @@ Result filter_and_sum_gpu_atomic_baseline(const Columns& columns, int iterations
     metrics.filter_ms = acc_filter * inv_it;
     metrics.scan_ms = 0.0;
     metrics.scatter_ms = 0.0;
+    metrics.reduce_ms = 0.0;
     metrics.d2h_ms = acc_d2h * inv_it;
     metrics.total_gpu_ms = acc_total * inv_it;
 
@@ -177,13 +262,17 @@ Result filter_and_sum_gpu_atomic_baseline(const Columns& columns, int iterations
     const double filter_s = metrics.filter_ms / 1000.0;
     metrics.rows_per_s = filter_s > 0.0 ? (static_cast<double>(n) / filter_s) : 0.0;
     metrics.filter_gb_per_s = filter_s > 0.0 ? (static_cast<double>(payload_bytes) / filter_s / 1e9) : 0.0;
+    metrics.reduce_rows_per_s = 0.0;
+    metrics.reduce_gb_per_s = 0.0;
     metrics.selectivity = n > 0 ? (static_cast<double>(last.count) / static_cast<double>(n)) : 0.0;
 
     return last;
 }
 
-FilterGpuMetrics filter_gpu_mask_only(const Columns& columns, int iterations, std::uint64_t& selected_count,
-                                      int threads_per_block) {
+enum class ReduceAlgorithm { Atomic, BlockPartial };
+
+Result filter_and_sum_gpu_compact_impl(const Columns& columns, int iterations, FilterGpuMetrics& metrics,
+                                       int threads_per_block, ReduceAlgorithm reduce_algorithm) {
     if (iterations < 1) {
         throw std::runtime_error("iterations must be >= 1");
     }
@@ -198,35 +287,57 @@ FilterGpuMetrics filter_gpu_mask_only(const Columns& columns, int iterations, st
     const std::size_t bytes_per_col = n * sizeof(float);
     const std::size_t payload_bytes = 2U * bytes_per_col;
 
-    selected_count = 0;
-    FilterGpuMetrics metrics{};
+    metrics = FilterGpuMetrics{};
     if (n == 0) {
-        return metrics;
+        return Result{};
     }
 
     float* d_trip = nullptr;
     float* d_fare = nullptr;
     std::uint8_t* d_mask = nullptr;
+    std::uint64_t* d_mask_u64 = nullptr;
+    std::uint64_t* d_offsets = nullptr;
+    std::uint32_t* d_selected_indices = nullptr;
+    unsigned long long* d_selected_count = nullptr;
+    double* d_sum = nullptr;
+    double* d_partial_sums = nullptr;
 
     cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_trip), bytes_per_col), "cudaMalloc d_trip");
     cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_fare), bytes_per_col), "cudaMalloc d_fare");
     cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_mask), n * sizeof(std::uint8_t)), "cudaMalloc d_mask");
+    cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_mask_u64), n * sizeof(std::uint64_t)), "cudaMalloc d_mask_u64");
+    cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_offsets), n * sizeof(std::uint64_t)), "cudaMalloc d_offsets");
+    cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_selected_indices), n * sizeof(std::uint32_t)),
+               "cudaMalloc d_selected_indices");
+    cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_selected_count), sizeof(unsigned long long)),
+               "cudaMalloc d_selected_count");
+    cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_sum), sizeof(double)), "cudaMalloc d_sum");
+
+    const int threads = threads_per_block;
+    const int blocks = static_cast<int>((n + static_cast<std::size_t>(threads) - 1U) /
+                                        static_cast<std::size_t>(threads));
+    const int reduce_blocks = compute_blocks(n, threads);
+    if (reduce_algorithm == ReduceAlgorithm::BlockPartial) {
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_partial_sums), static_cast<std::size_t>(reduce_blocks) * sizeof(double)),
+                   "cudaMalloc d_partial_sums");
+    }
 
     cudaEvent_t e0{}, e1{}, e2{}, e3{};
     events_create(e0, e1, e2, e3);
 
     double acc_h2d = 0.0;
     double acc_filter = 0.0;
+    double acc_scan = 0.0;
+    double acc_scatter = 0.0;
+    double acc_reduce = 0.0;
     double acc_d2h = 0.0;
     double acc_total = 0.0;
 
-    const int threads = threads_per_block;
-    const int blocks = static_cast<int>((n + static_cast<std::size_t>(threads) - 1U) /
-                                        static_cast<std::size_t>(threads));
-
-    std::vector<std::uint8_t> h_mask(n);
+    Result last{};
 
     for (int it = 0; it < iterations; ++it) {
+        cuda_check(cudaMemset(d_selected_count, 0, sizeof(unsigned long long)), "cudaMemset d_selected_count");
+        cuda_check(cudaMemset(d_sum, 0, sizeof(double)), "cudaMemset d_sum");
         cuda_check(cudaEventRecord(e0), "cudaEventRecord total_start");
 
         // H2D
@@ -247,10 +358,49 @@ FilterGpuMetrics filter_gpu_mask_only(const Columns& columns, int iterations, st
         cuda_check(cudaEventSynchronize(e2), "cudaEventSynchronize filter_end");
         acc_filter += elapsed_ms(e1, e2, "cudaEventElapsedTime filter");
 
-        // D2H (mask)
+        // Prefix-sum over mask to build write offsets.
+        cuda_check(cudaEventRecord(e1), "cudaEventRecord scan_start");
+        mask_u8_to_u64_kernel<<<blocks, threads>>>(d_mask, d_mask_u64, n);
+        cuda_check(cudaGetLastError(), "mask_u8_to_u64_kernel launch");
+        thrust::exclusive_scan(thrust::device, d_mask_u64, d_mask_u64 + n, d_offsets);
+        cuda_check(cudaGetLastError(), "thrust::exclusive_scan");
+        cuda_check(cudaEventRecord(e2), "cudaEventRecord scan_end");
+        cuda_check(cudaEventSynchronize(e2), "cudaEventSynchronize scan_end");
+        acc_scan += elapsed_ms(e1, e2, "cudaEventElapsedTime scan");
+
+        // Scatter selected row indices into compact output.
+        cuda_check(cudaEventRecord(e1), "cudaEventRecord scatter_start");
+        scatter_selected_indices_kernel<<<blocks, threads>>>(d_mask_u64, d_offsets, n, d_selected_indices);
+        cuda_check(cudaGetLastError(), "scatter_selected_indices_kernel launch");
+        write_selected_count_kernel<<<1, 1>>>(d_mask_u64, d_offsets, n, d_selected_count);
+        cuda_check(cudaGetLastError(), "write_selected_count_kernel launch");
+        cuda_check(cudaEventRecord(e2), "cudaEventRecord scatter_end");
+        cuda_check(cudaEventSynchronize(e2), "cudaEventSynchronize scatter_end");
+        acc_scatter += elapsed_ms(e1, e2, "cudaEventElapsedTime scatter");
+
+        // Reduce selected fares on GPU
+        cuda_check(cudaEventRecord(e1), "cudaEventRecord reduce_start");
+        if (reduce_algorithm == ReduceAlgorithm::Atomic) {
+            sum_selected_fares_atomic_kernel<<<reduce_blocks, threads>>>(d_fare, d_selected_indices, d_selected_count, d_sum);
+            cuda_check(cudaGetLastError(), "sum_selected_fares_atomic_kernel launch");
+        } else {
+            const std::size_t shmem_bytes = static_cast<std::size_t>(threads) * sizeof(double);
+            reduce_selected_fares_block_partials_kernel<<<reduce_blocks, threads, shmem_bytes>>>(
+                d_fare, d_selected_indices, d_selected_count, d_partial_sums);
+            cuda_check(cudaGetLastError(), "reduce_selected_fares_block_partials_kernel launch");
+            reduce_partial_sums_kernel<<<reduce_blocks, threads>>>(d_partial_sums, reduce_blocks, d_sum);
+            cuda_check(cudaGetLastError(), "reduce_partial_sums_kernel launch");
+        }
+        cuda_check(cudaEventRecord(e2), "cudaEventRecord reduce_end");
+        cuda_check(cudaEventSynchronize(e2), "cudaEventSynchronize reduce_end");
+        acc_reduce += elapsed_ms(e1, e2, "cudaEventElapsedTime reduce");
+
+        // D2H final results only
         cuda_check(cudaEventRecord(e1), "cudaEventRecord d2h_start");
-        cuda_check(cudaMemcpy(h_mask.data(), d_mask, n * sizeof(std::uint8_t), cudaMemcpyDeviceToHost),
-                    "cudaMemcpy D2H mask");
+        cuda_check(cudaMemcpy(&last.count, d_selected_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost),
+                   "cudaMemcpy D2H selected_count");
+        cuda_check(cudaMemcpy(&last.sum_fare_amount, d_sum, sizeof(double), cudaMemcpyDeviceToHost),
+                   "cudaMemcpy D2H sum");
         cuda_check(cudaEventRecord(e2), "cudaEventRecord d2h_end");
         cuda_check(cudaEventSynchronize(e2), "cudaEventSynchronize d2h_end");
         acc_d2h += elapsed_ms(e1, e2, "cudaEventElapsedTime d2h");
@@ -258,25 +408,27 @@ FilterGpuMetrics filter_gpu_mask_only(const Columns& columns, int iterations, st
         cuda_check(cudaEventRecord(e3), "cudaEventRecord total_end");
         cuda_check(cudaEventSynchronize(e3), "cudaEventSynchronize total_end");
         acc_total += elapsed_ms(e0, e3, "cudaEventElapsedTime total");
-
-        // simplest acceptable approach: count on CPU
-        std::uint64_t c = 0;
-        for (std::size_t i = 0; i < n; ++i) {
-            c += static_cast<std::uint64_t>(h_mask[i] != 0);
-        }
-        selected_count = c;
     }
 
     events_destroy(e0, e1, e2, e3);
     cudaFree(d_trip);
     cudaFree(d_fare);
     cudaFree(d_mask);
+    cudaFree(d_mask_u64);
+    cudaFree(d_offsets);
+    cudaFree(d_selected_indices);
+    cudaFree(d_selected_count);
+    cudaFree(d_sum);
+    if (d_partial_sums != nullptr) {
+        cudaFree(d_partial_sums);
+    }
 
     const double inv_it = 1.0 / static_cast<double>(iterations);
     metrics.h2d_ms = acc_h2d * inv_it;
     metrics.filter_ms = acc_filter * inv_it;
-    metrics.scan_ms = 0.0;
-    metrics.scatter_ms = 0.0;
+    metrics.scan_ms = acc_scan * inv_it;
+    metrics.scatter_ms = acc_scatter * inv_it;
+    metrics.reduce_ms = acc_reduce * inv_it;
     metrics.d2h_ms = acc_d2h * inv_it;
     metrics.total_gpu_ms = acc_total * inv_it;
 
@@ -287,9 +439,25 @@ FilterGpuMetrics filter_gpu_mask_only(const Columns& columns, int iterations, st
     const double filter_s = metrics.filter_ms / 1000.0;
     metrics.rows_per_s = filter_s > 0.0 ? (static_cast<double>(n) / filter_s) : 0.0;
     metrics.filter_gb_per_s = filter_s > 0.0 ? (static_cast<double>(payload_bytes) / filter_s / 1e9) : 0.0;
-    metrics.selectivity = n > 0 ? (static_cast<double>(selected_count) / static_cast<double>(n)) : 0.0;
+    const double reduce_s = metrics.reduce_ms / 1000.0;
+    metrics.reduce_rows_per_s = reduce_s > 0.0 ? (static_cast<double>(last.count) / reduce_s) : 0.0;
+    metrics.reduce_gb_per_s = reduce_s > 0.0
+                                  ? ((static_cast<double>(last.count) * sizeof(float)) / reduce_s / 1e9)
+                                  : 0.0;
+    metrics.selectivity = n > 0 ? (static_cast<double>(last.count) / static_cast<double>(n)) : 0.0;
 
-    return metrics;
+    return last;
+}
+
+Result filter_and_sum_gpu_compact_atomic(const Columns& columns, int iterations, FilterGpuMetrics& metrics,
+                                         int threads_per_block) {
+    return filter_and_sum_gpu_compact_impl(columns, iterations, metrics, threads_per_block, ReduceAlgorithm::Atomic);
+}
+
+Result filter_and_sum_gpu_compact_block_partial(const Columns& columns, int iterations, FilterGpuMetrics& metrics,
+                                                int threads_per_block) {
+    return filter_and_sum_gpu_compact_impl(columns, iterations, metrics, threads_per_block,
+                                           ReduceAlgorithm::BlockPartial);
 }
 
 } // namespace gq

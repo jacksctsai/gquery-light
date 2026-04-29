@@ -10,12 +10,15 @@ struct FilterGpuMetrics {
     double filter_ms{};
     double scan_ms{};
     double scatter_ms{};
+    double reduce_ms{};
     double d2h_ms{};
     double total_gpu_ms{};
 
     double effective_h2d_gb_per_s{};
     double filter_gb_per_s{};
     double rows_per_s{};
+    double reduce_rows_per_s{};
+    double reduce_gb_per_s{};
     double selectivity{};
 };
 
@@ -28,10 +31,20 @@ Result filter_and_sum_gpu_atomic_baseline(const Columns& columns, int iterations
                                           int threads_per_block = 256);
 
 /**
- * Filter only: produce a 0/1 mask on device. Count is computed by copying the mask back and counting on CPU.
+ * Filter + compact + reduce (atomic selected-sum baseline): build 0/1 mask on device, run prefix-sum,
+ * scatter selected row indices, then sum selected fares with global atomic adds. Only final count/sum
+ * are copied back.
  * Metrics are averaged over `iterations` runs.
  */
-FilterGpuMetrics filter_gpu_mask_only(const Columns& columns, int iterations, std::uint64_t& selected_count,
-                                      int threads_per_block = 256);
+Result filter_and_sum_gpu_compact_atomic(const Columns& columns, int iterations, FilterGpuMetrics& metrics,
+                                         int threads_per_block = 256);
+
+/**
+ * Filter + compact + reduce (block-partial): each block reduces selected fares into one partial sum,
+ * then a second-stage GPU reduction combines partials into the final sum.
+ * Metrics are averaged over `iterations` runs.
+ */
+Result filter_and_sum_gpu_compact_block_partial(const Columns& columns, int iterations, FilterGpuMetrics& metrics,
+                                                int threads_per_block = 256);
 
 } // namespace gq
