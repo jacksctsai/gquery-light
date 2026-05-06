@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <new>
 #include <vector>
@@ -9,6 +11,10 @@
 #endif
 
 namespace gq {
+
+// GROUP BY SUM(fare_amount) keyed by passenger_count: supported keys are
+// integers in [0, kMaxPassengerCountKey). Keys outside this range are skipped on GPU / tracked on CPU reference.
+inline constexpr int kMaxPassengerCountKey = 9;
 
 struct Row {
     float trip_distance{};
@@ -69,6 +75,19 @@ struct Columns {
 struct Result {
     std::uint64_t count{0};
     double sum_fare_amount{0.0};
+};
+
+struct GroupByPassengerFilteredResult {
+    std::array<std::uint64_t, static_cast<std::size_t>(kMaxPassengerCountKey)> count{};
+    std::array<double, static_cast<std::size_t>(kMaxPassengerCountKey)> sum{};
+    std::uint64_t selected_matching_rows{};
+    /** Matching predicate but passenger_count outside [0, kMaxPassengerCountKey). */
+    std::uint64_t out_of_range_selected_rows{};
+};
+
+struct GroupByGpuTable {
+    std::array<std::uint64_t, static_cast<std::size_t>(kMaxPassengerCountKey)> count{};
+    std::array<double, static_cast<std::size_t>(kMaxPassengerCountKey)> sum{};
 };
 
 } // namespace gq

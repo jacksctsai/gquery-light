@@ -2,6 +2,7 @@
 #include <iostream>
 #include <iomanip>
 #include <cmath>
+#include <cstdint>
 #include <string>
 #include <filesystem>
 #include <map>
@@ -13,6 +14,120 @@
 
 #ifdef GQUERY_USE_CUDA
 #include "gq/filter_gpu.hpp"
+#endif
+
+#ifdef GQUERY_USE_CUDA
+/** Distinct buckets in [0, kMaxPassengerCountKey) with nonzero CPU COUNT after filtering. */
+int count_nonempty_groupby_buckets(const gq::GroupByPassengerFilteredResult& gb) {
+    int c = 0;
+    for (int key = 0; key < gq::kMaxPassengerCountKey; ++key) {
+        if (gb.count[static_cast<std::size_t>(key)] != 0U) {
+            ++c;
+        }
+    }
+    return c;
+}
+
+void print_groupby_per_key_correctness(const gq::GroupByPassengerFilteredResult& cpu, const gq::GroupByGpuTable& gpu) {
+    constexpr double kAbsEps = 1e-9;
+    constexpr double kRelEps = 1e-9;
+
+    std::cout << "\n--- Per-key GROUP BY (passenger_count in [0, " << (gq::kMaxPassengerCountKey - 1) << "]) ---\n";
+    std::cout << std::setw(6) << "key" << " | " << std::setw(10) << "cpu_count" << " " << std::setw(10) << "gpu_count"
+              << " " << std::setw(12) << "count_delta" << " | " << std::setw(14) << "cpu_sum" << " " << std::setw(14)
+              << "gpu_sum" << " " << std::setw(14) << "sum_delta" << " | " << std::setw(8) << "correct" << "\n";
+
+    bool all_ok = true;
+    for (int key = 0; key < gq::kMaxPassengerCountKey; ++key) {
+        const std::size_t b = static_cast<std::size_t>(key);
+        const std::uint64_t cc = cpu.count[b];
+        const std::uint64_t gc = gpu.count[b];
+        const double cs = cpu.sum[b];
+        const double gs = gpu.sum[b];
+
+        const std::int64_t count_delta = static_cast<std::int64_t>(gc) - static_cast<std::int64_t>(cc);
+        const double sum_delta = gs - cs;
+        const double sum_tol = kAbsEps + kRelEps * std::max(std::abs(cs), 1.0);
+
+        const bool count_ok = (cc == gc);
+        const bool sum_ok = std::abs(sum_delta) <= sum_tol;
+        const bool row_ok = count_ok && sum_ok;
+        if (!row_ok) {
+            all_ok = false;
+        }
+
+        std::cout << std::setw(6) << key << " | " << std::setw(10) << cc << " " << std::setw(10) << gc << " "
+                  << std::setw(12) << count_delta << " | " << std::setw(14) << std::fixed << std::setprecision(7) << cs
+                  << " " << std::setw(14) << gs << " " << std::setw(14) << sum_delta << " | " << std::setw(8)
+                  << (row_ok ? "1" : "0") << "\n";
+    }
+
+    std::cout << "all_keys_correct: " << (all_ok ? "1" : "0") << "\n";
+    std::cout << "---------------------------------------------------------------\n";
+}
+
+void print_runbin_gpu_groupby_metrics(std::uint64_t file_bytes, std::uint64_t rows, int iterations, double load_ms,
+                                      int threads_per_block, const gq::FilterGpuMetrics& gpu, double total_ms,
+                                      const std::string& mode_csv, const std::string& groupby_algorithm_label) {
+    const std::uint64_t payload_bytes = rows * (2 * sizeof(float) + sizeof(std::uint8_t));
+    const double load_seconds = load_ms / 1000.0;
+    const double load_gb_per_s = load_seconds > 0.0 ? (static_cast<double>(file_bytes) / load_seconds / 1e9) : 0.0;
+
+    std::cout << "file_bytes: " << file_bytes << "\n";
+    std::cout << "payload_bytes: " << payload_bytes << "\n";
+    std::cout << "rows: " << rows << "\n";
+    std::cout << "iterations: " << iterations << "\n";
+    std::cout << "threads_per_block: " << threads_per_block << "\n";
+    std::cout << "load_ms: " << std::fixed << std::setprecision(4) << load_ms << "\n";
+    std::cout << "h2d_ms: " << std::fixed << std::setprecision(4) << gpu.h2d_ms << "\n";
+    std::cout << "filter_ms: " << gpu.filter_ms << "\n";
+    std::cout << "scan_ms: " << gpu.scan_ms << "\n";
+    std::cout << "scatter_ms: " << gpu.scatter_ms << "\n";
+    std::cout << "reduce_ms: " << gpu.reduce_ms << "\n";
+    std::cout << "groupby_ms: " << gpu.groupby_ms << "\n";
+    std::cout << "d2h_ms: " << gpu.d2h_ms << "\n";
+    std::cout << "total_gpu_ms: " << gpu.total_gpu_ms << "\n";
+    std::cout << "total_ms: " << total_ms << "\n";
+    std::cout << "effective_h2d_gb_per_s: " << gpu.effective_h2d_gb_per_s << "\n";
+    std::cout << "filter_gb_per_s: " << gpu.filter_gb_per_s << "\n";
+    std::cout << "rows_per_s: " << gpu.rows_per_s << "\n";
+    std::cout << "groupby_rows_per_s: " << gpu.groupby_rows_per_s << "\n";
+    std::cout << "groupby_gb_per_s: " << gpu.groupby_gb_per_s << "\n";
+    std::cout << "selectivity: " << gpu.selectivity << "\n";
+    std::cout << "selected_count: " << gpu.predicate_selected_count << "\n";
+    std::cout << "key_cardinality: " << gpu.key_cardinality << "\n";
+    std::cout << "max_key: " << gpu.max_key_observed << "\n";
+    std::cout << "groupby_algorithm: " << groupby_algorithm_label << "\n";
+    std::cout << "load_gb_per_s: " << load_gb_per_s << "\n";
+
+    std::cout << "mode=" << mode_csv << ",layout=soa,"
+              << "file_bytes=" << file_bytes << ","
+              << "payload_bytes=" << payload_bytes << ","
+              << "rows=" << rows << ","
+              << "iterations=" << iterations << ","
+              << "threads_per_block=" << threads_per_block << ","
+              << "load_ms=" << load_ms << ","
+              << "h2d_ms=" << gpu.h2d_ms << ","
+              << "filter_ms=" << gpu.filter_ms << ","
+              << "scan_ms=" << gpu.scan_ms << ","
+              << "scatter_ms=" << gpu.scatter_ms << ","
+              << "reduce_ms=" << gpu.reduce_ms << ","
+              << "groupby_ms=" << gpu.groupby_ms << ","
+              << "d2h_ms=" << gpu.d2h_ms << ","
+              << "total_gpu_ms=" << gpu.total_gpu_ms << ","
+              << "total_ms=" << total_ms << ","
+              << "effective_h2d_gb_per_s=" << gpu.effective_h2d_gb_per_s << ","
+              << "filter_gb_per_s=" << gpu.filter_gb_per_s << ","
+              << "rows_per_s=" << gpu.rows_per_s << ","
+              << "groupby_rows_per_s=" << gpu.groupby_rows_per_s << ","
+              << "groupby_gb_per_s=" << gpu.groupby_gb_per_s << ","
+              << "selectivity=" << gpu.selectivity << ","
+              << "selected_count=" << gpu.predicate_selected_count << ","
+              << "key_cardinality=" << gpu.key_cardinality << ","
+              << "max_key=" << gpu.max_key_observed << ","
+              << "groupby_algorithm=" << groupby_algorithm_label << ","
+              << "load_gb_per_s=" << load_gb_per_s << "\n";
+}
 #endif
 
 void print_cardinality(const gq::CardinalityResult& card) {
@@ -224,6 +339,8 @@ int main(int argc, char** argv) {
                       << "  " << argv[0] << " csv2bin <input.csv> <output.bin>\n"
                       << "  " << argv[0] << " runbin <input.bin> <iterations>\n"
                       << "  " << argv[0] << " runbin_gpu_atomic <input.bin> [iterations] [threads_per_block]\n"
+                      << "  " << argv[0] << " runbin_gpu_groupby_atomic <input.bin> [iterations] [threads_per_block]\n"
+                      << "  " << argv[0] << " runbin_gpu_groupby_block_partial <input.bin> [iterations] [threads_per_block]\n"
                       << "  " << argv[0] << " runbin_gpu_mask_atomic <input.bin> [iterations] [threads_per_block]\n"
                       << "  " << argv[0] << " runbin_gpu_mask_block_partial <input.bin> [iterations] [threads_per_block]\n"
                       << "  " << argv[0] << " runbin_gpu_mask <input.bin> [iterations] [threads_per_block]\n"
@@ -277,6 +394,94 @@ int main(int argc, char** argv) {
                                      gpu_metrics, total_ms, gpu_result.count, gpu_result.sum_fare_amount);
             const gq::Result cpu_result = gq::filter_and_sum_soa(bin_result.columns);
             print_cpu_gpu_correctness(cpu_result, gpu_result);
+            return 0;
+#endif
+        } else if (cmd == "runbin_gpu_groupby_atomic") {
+#ifndef GQUERY_USE_CUDA
+            std::cerr << "error: CUDA not enabled in this build\n";
+            return 1;
+#else
+            if (argc < 3) {
+                std::cerr << "Usage: " << argv[0]
+                          << " runbin_gpu_groupby_atomic <input.bin> [iterations] [threads_per_block]\n";
+                return 1;
+            }
+            std::string input_bin = argv[2];
+            const int iterations = (argc > 3) ? std::stoi(argv[3]) : 1;
+            const int threads_per_block = (argc > 4) ? std::stoi(argv[4]) : 256;
+
+            gq::CpuTimer total_timer;
+            gq::CpuTimer load_timer;
+            auto bin_result = gq::read_binary(input_bin);
+            const double load_ms = load_timer.elapsed_ms();
+
+            auto card = gq::compute_cardinality_soa(bin_result.columns);
+            print_cardinality(card);
+
+            const gq::GroupByPassengerFilteredResult cpu_gb = gq::filter_groupby_passenger_count_soa(bin_result.columns);
+
+            gq::FilterGpuMetrics gpu_metrics{};
+            const gq::GroupByGpuTable gpu_gb =
+                gq::filter_groupby_gpu_atomic_baseline(bin_result.columns, iterations, gpu_metrics, threads_per_block);
+            const double total_ms = total_timer.elapsed_ms();
+
+            gpu_metrics.max_key_observed = static_cast<int>(card.max_key);
+            gpu_metrics.key_cardinality = count_nonempty_groupby_buckets(cpu_gb);
+
+            if (cpu_gb.out_of_range_selected_rows != 0U) {
+                std::cout << "note: WHERE matched " << cpu_gb.out_of_range_selected_rows
+                          << " row(s) with passenger_count outside [0," << gq::kMaxPassengerCountKey
+                          << "); those are omitted from GPU/CPU keyed aggregates above.\n";
+            }
+
+            print_runbin_gpu_groupby_metrics(bin_result.file_bytes, bin_result.rows, iterations, load_ms,
+                                             threads_per_block, gpu_metrics, total_ms, "gpu_groupby_atomic",
+                                             "naive_atomic_per_key_global");
+            print_groupby_per_key_correctness(cpu_gb, gpu_gb);
+            return 0;
+#endif
+        } else if (cmd == "runbin_gpu_groupby_block_partial") {
+#ifndef GQUERY_USE_CUDA
+            std::cerr << "error: CUDA not enabled in this build\n";
+            return 1;
+#else
+            if (argc < 3) {
+                std::cerr << "Usage: " << argv[0]
+                          << " runbin_gpu_groupby_block_partial <input.bin> [iterations] [threads_per_block]\n";
+                return 1;
+            }
+            std::string input_bin = argv[2];
+            const int iterations = (argc > 3) ? std::stoi(argv[3]) : 1;
+            const int threads_per_block = (argc > 4) ? std::stoi(argv[4]) : 256;
+
+            gq::CpuTimer total_timer;
+            gq::CpuTimer load_timer;
+            auto bin_result = gq::read_binary(input_bin);
+            const double load_ms = load_timer.elapsed_ms();
+
+            auto card = gq::compute_cardinality_soa(bin_result.columns);
+            print_cardinality(card);
+
+            const gq::GroupByPassengerFilteredResult cpu_gb = gq::filter_groupby_passenger_count_soa(bin_result.columns);
+
+            gq::FilterGpuMetrics gpu_metrics{};
+            const gq::GroupByGpuTable gpu_gb = gq::filter_groupby_gpu_compact_block_partial(
+                bin_result.columns, iterations, gpu_metrics, threads_per_block);
+            const double total_ms = total_timer.elapsed_ms();
+
+            gpu_metrics.max_key_observed = static_cast<int>(card.max_key);
+            gpu_metrics.key_cardinality = count_nonempty_groupby_buckets(cpu_gb);
+
+            if (cpu_gb.out_of_range_selected_rows != 0U) {
+                std::cout << "note: WHERE matched " << cpu_gb.out_of_range_selected_rows
+                          << " row(s) with passenger_count outside [0," << gq::kMaxPassengerCountKey
+                          << "); those are omitted from GPU/CPU keyed aggregates above.\n";
+            }
+
+            print_runbin_gpu_groupby_metrics(bin_result.file_bytes, bin_result.rows, iterations, load_ms,
+                                             threads_per_block, gpu_metrics, total_ms, "gpu_groupby_block_partial",
+                                             "compact_block_partial_per_key_merge");
+            print_groupby_per_key_correctness(cpu_gb, gpu_gb);
             return 0;
 #endif
         } else if (cmd == "runbin_gpu_mask" || cmd == "runbin_gpu_mask_atomic" || cmd == "runbin_gpu_mask_block_partial") {
