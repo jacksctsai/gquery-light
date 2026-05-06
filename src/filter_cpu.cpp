@@ -1,6 +1,7 @@
 #include "gq/filter_cpu.hpp"
 
 #include <stdexcept>
+#include <algorithm>
 
 namespace gq {
 
@@ -23,6 +24,20 @@ Result filter_and_sum_soa(const Columns& columns) {
     }
 
     return result;
+}
+
+CardinalityResult compute_cardinality_soa(const Columns& columns) {
+    CardinalityResult res;
+    if (columns.passenger_count.empty()) {
+         return res;
+    }
+    
+    for (const auto& pc : columns.passenger_count) {
+        res.counts[pc]++;
+        res.min_key = std::min(res.min_key, pc);
+        res.max_key = std::max(res.max_key, pc);
+    }
+    return res;
 }
 
 } // namespace gq

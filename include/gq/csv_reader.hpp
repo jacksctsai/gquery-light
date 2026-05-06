@@ -17,6 +17,7 @@ struct CsvReadResult {
 };
 
 struct CsvLayout {
+    std::size_t passenger_count_idx{};
     std::size_t trip_distance_idx{};
     std::size_t fare_amount_idx{};
 };
@@ -37,11 +38,13 @@ private:
     static void extract_target_fields(
         const std::string& line,
         const CsvLayout& layout,
+        std::uint8_t& passenger_count,
         float& trip_distance,
         float& fare_amount,
         std::uint64_t line_number);
 
     static float parse_float_token(const std::string& line, std::size_t start, std::size_t end, const char* column_name, std::uint64_t line_number);
+    static std::uint8_t parse_uint8_token(const std::string& line, std::size_t start, std::size_t end, const char* column_name, std::uint64_t line_number);
 };
 
 } // namespace gq

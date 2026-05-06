@@ -4,6 +4,7 @@
 #include <cmath>
 #include <string>
 #include <filesystem>
+#include <map>
 
 #include "gq/csv_reader.hpp"
 #include "gq/filter_cpu.hpp"
@@ -14,9 +15,23 @@
 #include "gq/filter_gpu.hpp"
 #endif
 
+void print_cardinality(const gq::CardinalityResult& card) {
+    std::cout << "\n--- Passenger Count Cardinality ---\n";
+    std::cout << "Distinct Keys: " << card.counts.size() << "\n";
+    if (!card.counts.empty()) {
+        std::cout << "Min Key: " << static_cast<int>(card.min_key) << "\n";
+        std::cout << "Max Key: " << static_cast<int>(card.max_key) << "\n";
+        std::cout << "Counts:\n";
+        for (const auto& [k, v] : card.counts) {
+            std::cout << "  " << static_cast<int>(k) << ": " << v << "\n";
+        }
+    }
+    std::cout << "-----------------------------------\n";
+}
+
 void print_metrics(const std::string& mode, const std::string& layout, std::uint64_t file_bytes, std::uint64_t rows, int iterations, double load_ms, double filter_ms_avg, double total_ms, std::uint64_t count, double sum_fare_amount, double parse_mb_per_s) {
     
-    std::uint64_t payload_bytes = rows * 2 * sizeof(float);
+    std::uint64_t payload_bytes = rows * (2 * sizeof(float) + sizeof(std::uint8_t));
     double filter_seconds_avg = filter_ms_avg / 1000.0;
     double filter_gb_per_s = filter_seconds_avg > 0.0 ? (static_cast<double>(payload_bytes) / filter_seconds_avg / 1e9) : 0.0;
     
@@ -60,7 +75,7 @@ void print_metrics(const std::string& mode, const std::string& layout, std::uint
 void print_runbin_gpu_metrics(std::uint64_t file_bytes, std::uint64_t rows, int iterations, double load_ms,
                               int threads_per_block, const gq::FilterGpuMetrics& gpu, double total_ms, std::uint64_t count,
                               double sum_fare_amount) {
-    const std::uint64_t payload_bytes = rows * 2 * sizeof(float);
+    const std::uint64_t payload_bytes = rows * (2 * sizeof(float) + sizeof(std::uint8_t));
     const double load_seconds = load_ms / 1000.0;
     const double load_gb_per_s = load_seconds > 0.0 ? (static_cast<double>(file_bytes) / load_seconds / 1e9) : 0.0;
 
@@ -249,6 +264,9 @@ int main(int argc, char** argv) {
             gq::CpuTimer load_timer;
             auto bin_result = gq::read_binary(input_bin);
             double load_ms = load_timer.elapsed_ms();
+            
+            auto card = gq::compute_cardinality_soa(bin_result.columns);
+            print_cardinality(card);
 
             gq::FilterGpuMetrics gpu_metrics{};
             const gq::Result gpu_result =
@@ -279,6 +297,9 @@ int main(int argc, char** argv) {
             gq::CpuTimer load_timer;
             auto bin_result = gq::read_binary(input_bin);
             double load_ms = load_timer.elapsed_ms();
+            
+            auto card = gq::compute_cardinality_soa(bin_result.columns);
+            print_cardinality(card);
 
             gq::FilterGpuMetrics gpu_metrics{};
             gq::Result gpu_result{};
@@ -313,6 +334,9 @@ int main(int argc, char** argv) {
             gq::CpuTimer load_timer;
             auto bin_result = gq::read_binary(input_bin);
             double load_ms = load_timer.elapsed_ms();
+            
+            auto card = gq::compute_cardinality_soa(bin_result.columns);
+            print_cardinality(card);
 
             gq::Result filter_result{};
 #ifdef GQUERY_USE_CUDA
@@ -349,6 +373,9 @@ int main(int argc, char** argv) {
             gq::CsvReader reader;
             auto read_result = reader.read_soa(input_csv);
             double parse_ms = parse_timer.elapsed_ms();
+
+            auto card = gq::compute_cardinality_soa(read_result.columns);
+            print_cardinality(card);
 
             // 2. Filtering repeatedly
             gq::Result filter_result{};

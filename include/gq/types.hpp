@@ -54,11 +54,14 @@ inline bool operator!=(const CudaPinnedAllocator<T>&, const CudaPinnedAllocator<
 }
 
 using HostFloatVector = std::vector<float, CudaPinnedAllocator<float>>;
+using HostUint8Vector = std::vector<std::uint8_t, CudaPinnedAllocator<std::uint8_t>>;
 #else
 using HostFloatVector = std::vector<float>;
+using HostUint8Vector = std::vector<std::uint8_t>;
 #endif
 
 struct Columns {
+    HostUint8Vector passenger_count;
     HostFloatVector trip_distance;
     HostFloatVector fare_amount;
 };

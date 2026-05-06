@@ -37,6 +37,7 @@ std::size_t CsvReader::find_column_index(const std::vector<std::string>& columns
 CsvLayout CsvReader::resolve_layout(const std::string& header) {
     auto columns = split_header(header);
     CsvLayout layout;
+    layout.passenger_count_idx = find_column_index(columns, "passenger_count");
     layout.trip_distance_idx = find_column_index(columns, "trip_distance");
     layout.fare_amount_idx = find_column_index(columns, "fare_amount");
     return layout;
@@ -68,9 +69,26 @@ float CsvReader::parse_float_token(const std::string& line, std::size_t start, s
     }
 }
 
+std::uint8_t CsvReader::parse_uint8_token(const std::string& line, std::size_t start, std::size_t end, const char* column_name, std::uint64_t line_number) {
+    if (start >= end) {
+        // Defensively handle missing/empty passenger counts
+        return 0;
+    }
+    try {
+        int val = std::stoi(line.substr(start, end - start));
+        if (val < 0 || val > 255) {
+             return 0; // Out of bounds, defensive fallback
+        }
+        return static_cast<std::uint8_t>(val);
+    } catch (const std::exception& e) {
+        return 0; // Malformed data, defensive fallback
+    }
+}
+
 void CsvReader::extract_target_fields(
     const std::string& line,
     const CsvLayout& layout,
+    std::uint8_t& passenger_count,
     float& trip_distance,
     float& fare_amount,
     std::uint64_t line_number) {
@@ -79,11 +97,15 @@ void CsvReader::extract_target_fields(
     std::size_t start = 0;
     std::size_t end = 0;
     
+    bool passenger_count_found = false;
     bool trip_distance_found = false;
     bool fare_amount_found = false;
 
     while ((end = line.find(',', start)) != std::string::npos) {
-        if (current_col == layout.trip_distance_idx) {
+        if (current_col == layout.passenger_count_idx) {
+            passenger_count = parse_uint8_token(line, start, end, "passenger_count", line_number);
+            passenger_count_found = true;
+        } else if (current_col == layout.trip_distance_idx) {
             trip_distance = parse_float_token(line, start, end, "trip_distance", line_number);
             trip_distance_found = true;
         } else if (current_col == layout.fare_amount_idx) {
@@ -95,7 +117,10 @@ void CsvReader::extract_target_fields(
     }
     
     // Check last column
-    if (current_col == layout.trip_distance_idx) {
+    if (current_col == layout.passenger_count_idx) {
+        passenger_count = parse_uint8_token(line, start, line.size(), "passenger_count", line_number);
+        passenger_count_found = true;
+    } else if (current_col == layout.trip_distance_idx) {
         trip_distance = parse_float_token(line, start, line.size(), "trip_distance", line_number);
         trip_distance_found = true;
     } else if (current_col == layout.fare_amount_idx) {
@@ -103,7 +128,7 @@ void CsvReader::extract_target_fields(
         fare_amount_found = true;
     }
 
-    if (!trip_distance_found || !fare_amount_found) {
+    if (!trip_distance_found || !fare_amount_found || !passenger_count_found) {
         throw std::runtime_error("Missing required columns in CSV at line " + std::to_string(line_number));
     }
 }
@@ -129,6 +154,7 @@ CsvReadResult CsvReader::read_soa(const std::filesystem::path& path) const {
     CsvLayout layout = resolve_layout(header);
     
     Columns columns;
+    columns.passenger_count.resize(rows);
     columns.trip_distance.resize(rows);
     columns.fare_amount.resize(rows);
     
@@ -140,7 +166,7 @@ CsvReadResult CsvReader::read_soa(const std::filesystem::path& path) const {
             throw std::runtime_error("Row count mismatch");
         } // Should not happen if file hasn't changed
         trim_cr(line);
-        extract_target_fields(line, layout, columns.trip_distance[current_row], columns.fare_amount[current_row], current_row + 2);
+        extract_target_fields(line, layout, columns.passenger_count[current_row], columns.trip_distance[current_row], columns.fare_amount[current_row], current_row + 2);
         current_row++;
     }
     if (current_row != rows) {
