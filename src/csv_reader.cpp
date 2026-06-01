@@ -4,6 +4,7 @@
 #include <sstream>
 #include <fstream>
 #include <string>
+#include <limits>
 
 static void trim_cr(std::string& s) {
     if (!s.empty() && s.back() == '\r') {
@@ -69,17 +70,22 @@ float CsvReader::parse_float_token(const std::string& line, std::size_t start, s
     }
 }
 
-std::uint8_t CsvReader::parse_uint8_token(const std::string& line, std::size_t start, std::size_t end, const char* column_name, std::uint64_t line_number) {
+std::uint32_t CsvReader::parse_uint32_token(const std::string& line, std::size_t start, std::size_t end, const char* column_name, std::uint64_t line_number) {
+    (void)column_name;
+    (void)line_number;
     if (start >= end) {
         // Defensively handle missing/empty passenger counts
         return 0;
     }
     try {
-        int val = std::stoi(line.substr(start, end - start));
-        if (val < 0 || val > 255) {
-             return 0; // Out of bounds, defensive fallback
+        long long val = std::stoll(line.substr(start, end - start));
+        if (val < 0) {
+            return 0;
         }
-        return static_cast<std::uint8_t>(val);
+        if (val > static_cast<long long>(std::numeric_limits<std::uint32_t>::max())) {
+            return 0;
+        }
+        return static_cast<std::uint32_t>(val);
     } catch (const std::exception& e) {
         return 0; // Malformed data, defensive fallback
     }
@@ -88,7 +94,7 @@ std::uint8_t CsvReader::parse_uint8_token(const std::string& line, std::size_t s
 void CsvReader::extract_target_fields(
     const std::string& line,
     const CsvLayout& layout,
-    std::uint8_t& passenger_count,
+    std::uint32_t& passenger_count,
     float& trip_distance,
     float& fare_amount,
     std::uint64_t line_number) {
@@ -103,7 +109,7 @@ void CsvReader::extract_target_fields(
 
     while ((end = line.find(',', start)) != std::string::npos) {
         if (current_col == layout.passenger_count_idx) {
-            passenger_count = parse_uint8_token(line, start, end, "passenger_count", line_number);
+            passenger_count = parse_uint32_token(line, start, end, "passenger_count", line_number);
             passenger_count_found = true;
         } else if (current_col == layout.trip_distance_idx) {
             trip_distance = parse_float_token(line, start, end, "trip_distance", line_number);
@@ -118,7 +124,7 @@ void CsvReader::extract_target_fields(
     
     // Check last column
     if (current_col == layout.passenger_count_idx) {
-        passenger_count = parse_uint8_token(line, start, line.size(), "passenger_count", line_number);
+        passenger_count = parse_uint32_token(line, start, line.size(), "passenger_count", line_number);
         passenger_count_found = true;
     } else if (current_col == layout.trip_distance_idx) {
         trip_distance = parse_float_token(line, start, line.size(), "trip_distance", line_number);

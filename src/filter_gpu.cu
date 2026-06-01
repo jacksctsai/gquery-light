@@ -51,9 +51,10 @@ inline int compute_blocks(std::size_t items, int threads_per_block, int max_bloc
 }
 
 __global__ void filter_groupby_atomic_naive_kernel(const float* trip_distance, const float* fare_amount,
-                                                   const std::uint8_t* passenger_count, std::size_t n,
+                                                   const std::uint32_t* passenger_count, std::size_t n,
                                                    double* group_sum, unsigned long long* group_count,
-                                                   unsigned long long* predicate_match_count, int key_upper_exclusive) {
+                                                   unsigned long long* predicate_match_count,
+                                                   std::uint32_t key_upper_exclusive) {
     const std::size_t tid = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::size_t stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
     for (std::size_t i = tid; i < n; i += stride) {
@@ -61,8 +62,8 @@ __global__ void filter_groupby_atomic_naive_kernel(const float* trip_distance, c
         const float fa = fare_amount[i];
         if (td > 2.5f && fa > 10.0f) {
             atomicAdd(predicate_match_count, 1ULL);
-            const int pk = static_cast<int>(passenger_count[i]);
-            if (pk >= 0 && pk < key_upper_exclusive) {
+            const std::uint32_t pk = passenger_count[i];
+            if (pk < key_upper_exclusive) {
                 atomicAdd(&group_sum[pk], static_cast<double>(fa));
                 atomicAdd(&group_count[pk], 1ULL);
             }
@@ -70,22 +71,22 @@ __global__ void filter_groupby_atomic_naive_kernel(const float* trip_distance, c
     }
 }
 
-template <int K>
-__global__ void groupby_selected_block_partial_kernel(const float* fare_amount, const std::uint8_t* passenger_count,
+__global__ void groupby_selected_block_partial_kernel(const float* fare_amount, const std::uint32_t* passenger_count,
                                                       const std::uint32_t* selected_indices,
                                                       const unsigned long long* selected_count,
-                                                      double* d_group_sum, unsigned long long* d_group_count) {
-    __shared__ double s_sum[K];
-    __shared__ unsigned long long s_cnt[K];
+                                                      double* d_group_sum, unsigned long long* d_group_count,
+                                                      std::uint32_t num_groups) {
+    extern __shared__ unsigned char s_mem[];
+    double* s_sum = reinterpret_cast<double*>(s_mem);
+    unsigned long long* s_cnt =
+        reinterpret_cast<unsigned long long*>(s_mem + static_cast<std::size_t>(num_groups) * sizeof(double));
 
-    if (threadIdx.x < static_cast<unsigned int>(K)) {
-        s_sum[threadIdx.x] = 0.0;
-        s_cnt[threadIdx.x] = 0ULL;
+    for (std::uint32_t k = static_cast<std::uint32_t>(threadIdx.x); k < num_groups;
+         k += static_cast<std::uint32_t>(blockDim.x)) {
+        s_sum[k] = 0.0;
+        s_cnt[k] = 0ULL;
     }
     __syncthreads();
-
-    double local_sum[K]{};
-    unsigned long long local_cnt[K]{};
 
     const unsigned long long sel_count = *selected_count;
     const std::size_t tid = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -93,25 +94,19 @@ __global__ void groupby_selected_block_partial_kernel(const float* fare_amount, 
 
     for (std::size_t i = tid; i < sel_count; i += stride) {
         const std::uint32_t row = selected_indices[i];
-        const int pk = static_cast<int>(passenger_count[row]);
-        if (pk >= 0 && pk < K) {
-            local_sum[pk] += static_cast<double>(fare_amount[row]);
-            ++local_cnt[pk];
-        }
-    }
-
-    for (int k = 0; k < K; ++k) {
-        if (local_cnt[k] != 0ULL) {
-            atomicAdd(&s_sum[k], local_sum[k]);
-            atomicAdd(&s_cnt[k], local_cnt[k]);
+        const std::uint32_t pk = passenger_count[row];
+        if (pk < num_groups) {
+            atomicAdd(&s_sum[pk], static_cast<double>(fare_amount[row]));
+            atomicAdd(&s_cnt[pk], 1ULL);
         }
     }
     __syncthreads();
 
-    if (threadIdx.x < static_cast<unsigned int>(K)) {
-        if (s_cnt[threadIdx.x] != 0ULL) {
-            atomicAdd(&d_group_sum[threadIdx.x], s_sum[threadIdx.x]);
-            atomicAdd(&d_group_count[threadIdx.x], s_cnt[threadIdx.x]);
+    for (std::uint32_t k = static_cast<std::uint32_t>(threadIdx.x); k < num_groups;
+         k += static_cast<std::uint32_t>(blockDim.x)) {
+        if (s_cnt[k] != 0ULL) {
+            atomicAdd(&d_group_sum[k], s_sum[k]);
+            atomicAdd(&d_group_count[k], s_cnt[k]);
         }
     }
 }
@@ -527,7 +522,7 @@ Result filter_and_sum_gpu_compact_block_partial(const Columns& columns, int iter
 }
 
 GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int iterations, FilterGpuMetrics& metrics,
-                                                   int threads_per_block) {
+                                                   std::size_t num_groups, int threads_per_block) {
     if (iterations < 1) {
         throw std::runtime_error("iterations must be >= 1");
     }
@@ -537,17 +532,22 @@ GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int i
     if (columns.passenger_count.size() != columns.trip_distance.size()) {
         throw std::runtime_error("passenger_count column size mismatch");
     }
+    if (num_groups == 0) {
+        throw std::runtime_error("num_groups must be > 0");
+    }
     if (threads_per_block <= 0) {
         throw std::runtime_error("threads_per_block must be > 0");
     }
 
     const std::size_t n = columns.trip_distance.size();
     const std::size_t bytes_float_col = n * sizeof(float);
-    const std::size_t bytes_pc = n * sizeof(std::uint8_t);
+    const std::size_t bytes_pc = n * sizeof(std::uint32_t);
     const std::size_t payload_bytes = 2U * bytes_float_col + bytes_pc;
 
     metrics = FilterGpuMetrics{};
     GroupByGpuTable last{};
+    last.sum.assign(num_groups, 0.0);
+    last.count.assign(num_groups, 0U);
 
     if (n == 0) {
         return last;
@@ -555,7 +555,7 @@ GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int i
 
     float* d_trip = nullptr;
     float* d_fare = nullptr;
-    std::uint8_t* d_pc = nullptr;
+    std::uint32_t* d_pc = nullptr;
     double* d_group_sum = nullptr;
     unsigned long long* d_group_count = nullptr;
     unsigned long long* d_pred_match = nullptr;
@@ -564,10 +564,10 @@ GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int i
     cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_fare), bytes_float_col), "cudaMalloc d_fare");
     cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_pc), bytes_pc), "cudaMalloc d_pc");
     cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_group_sum),
-                          static_cast<std::size_t>(kMaxPassengerCountKey) * sizeof(double)),
+                          static_cast<std::size_t>(num_groups) * sizeof(double)),
                "cudaMalloc d_group_sum");
     cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_group_count),
-                          static_cast<std::size_t>(kMaxPassengerCountKey) * sizeof(unsigned long long)),
+                          static_cast<std::size_t>(num_groups) * sizeof(unsigned long long)),
                "cudaMalloc d_group_count");
     cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_pred_match), sizeof(unsigned long long)),
                "cudaMalloc d_pred_match");
@@ -587,10 +587,10 @@ GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int i
     std::uint64_t selected_for_selectivity = 0;
 
     for (int it = 0; it < iterations; ++it) {
-        cuda_check(cudaMemset(d_group_sum, 0, static_cast<std::size_t>(kMaxPassengerCountKey) * sizeof(double)),
+        cuda_check(cudaMemset(d_group_sum, 0, static_cast<std::size_t>(num_groups) * sizeof(double)),
                     "cudaMemset d_group_sum");
         cuda_check(cudaMemset(d_group_count, 0,
-                              static_cast<std::size_t>(kMaxPassengerCountKey) * sizeof(unsigned long long)),
+                              static_cast<std::size_t>(num_groups) * sizeof(unsigned long long)),
                     "cudaMemset d_group_count");
         cuda_check(cudaMemset(d_pred_match, 0, sizeof(unsigned long long)), "cudaMemset d_pred_match");
 
@@ -609,19 +609,18 @@ GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int i
 
         cuda_check(cudaEventRecord(e1), "cudaEventRecord groupby_start");
         filter_groupby_atomic_naive_kernel<<<blocks, threads>>>(d_trip, d_fare, d_pc, n, d_group_sum, d_group_count,
-                                                                 d_pred_match, kMaxPassengerCountKey);
+                                                                d_pred_match, static_cast<std::uint32_t>(num_groups));
         cuda_check(cudaGetLastError(), "filter_groupby_atomic_naive_kernel launch");
         cuda_check(cudaEventRecord(e2), "cudaEventRecord groupby_end");
         cuda_check(cudaEventSynchronize(e2), "cudaEventSynchronize groupby_end");
         acc_groupby += elapsed_ms(e1, e2, "cudaEventElapsedTime groupby");
 
         cuda_check(cudaEventRecord(e1), "cudaEventRecord d2h_start");
-        cuda_check(cudaMemcpy(last.sum.data(), d_group_sum,
-                              static_cast<std::size_t>(kMaxPassengerCountKey) * sizeof(double),
+        cuda_check(cudaMemcpy(last.sum.data(), d_group_sum, static_cast<std::size_t>(num_groups) * sizeof(double),
                               cudaMemcpyDeviceToHost),
                    "cudaMemcpy D2H group_sum");
         cuda_check(cudaMemcpy(last.count.data(), d_group_count,
-                              static_cast<std::size_t>(kMaxPassengerCountKey) * sizeof(unsigned long long),
+                              static_cast<std::size_t>(num_groups) * sizeof(unsigned long long),
                               cudaMemcpyDeviceToHost),
                    "cudaMemcpy D2H group_count");
         cuda_check(cudaMemcpy(&selected_for_selectivity, d_pred_match, sizeof(unsigned long long),
@@ -674,7 +673,7 @@ GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int i
 }
 
 GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns, int iterations, FilterGpuMetrics& metrics,
-                                                         int threads_per_block) {
+                                                         std::size_t num_groups, int threads_per_block) {
     if (iterations < 1) {
         throw std::runtime_error("iterations must be >= 1");
     }
@@ -684,17 +683,22 @@ GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns,
     if (columns.passenger_count.size() != columns.trip_distance.size()) {
         throw std::runtime_error("passenger_count column size mismatch");
     }
+    if (num_groups == 0) {
+        throw std::runtime_error("num_groups must be > 0");
+    }
     if (threads_per_block <= 0) {
         throw std::runtime_error("threads_per_block must be > 0");
     }
 
     const std::size_t n = columns.trip_distance.size();
     const std::size_t bytes_float_col = n * sizeof(float);
-    const std::size_t bytes_pc = n * sizeof(std::uint8_t);
+    const std::size_t bytes_pc = n * sizeof(std::uint32_t);
     const std::size_t payload_bytes = 2U * bytes_float_col + bytes_pc;
 
     metrics = FilterGpuMetrics{};
     GroupByGpuTable last{};
+    last.sum.assign(num_groups, 0.0);
+    last.count.assign(num_groups, 0U);
 
     if (n == 0) {
         return last;
@@ -702,7 +706,7 @@ GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns,
 
     float* d_trip = nullptr;
     float* d_fare = nullptr;
-    std::uint8_t* d_pc = nullptr;
+    std::uint32_t* d_pc = nullptr;
     std::uint8_t* d_mask = nullptr;
     std::uint64_t* d_mask_u64 = nullptr;
     std::uint64_t* d_offsets = nullptr;
@@ -722,10 +726,10 @@ GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns,
     cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_selected_count), sizeof(unsigned long long)),
                "cudaMalloc d_selected_count");
     cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_group_sum),
-                          static_cast<std::size_t>(kMaxPassengerCountKey) * sizeof(double)),
+                          static_cast<std::size_t>(num_groups) * sizeof(double)),
                "cudaMalloc d_group_sum");
     cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_group_count),
-                          static_cast<std::size_t>(kMaxPassengerCountKey) * sizeof(unsigned long long)),
+                          static_cast<std::size_t>(num_groups) * sizeof(unsigned long long)),
                "cudaMalloc d_group_count");
 
     const int threads = threads_per_block;
@@ -748,10 +752,10 @@ GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns,
 
     for (int it = 0; it < iterations; ++it) {
         cuda_check(cudaMemset(d_selected_count, 0, sizeof(unsigned long long)), "cudaMemset d_selected_count");
-        cuda_check(cudaMemset(d_group_sum, 0, static_cast<std::size_t>(kMaxPassengerCountKey) * sizeof(double)),
+        cuda_check(cudaMemset(d_group_sum, 0, static_cast<std::size_t>(num_groups) * sizeof(double)),
                     "cudaMemset d_group_sum");
         cuda_check(cudaMemset(d_group_count, 0,
-                              static_cast<std::size_t>(kMaxPassengerCountKey) * sizeof(unsigned long long)),
+                              static_cast<std::size_t>(num_groups) * sizeof(unsigned long long)),
                     "cudaMemset d_group_count");
 
         cuda_check(cudaEventRecord(e0), "cudaEventRecord total_start");
@@ -793,8 +797,11 @@ GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns,
         acc_scatter += elapsed_ms(e1, e2, "cudaEventElapsedTime scatter");
 
         cuda_check(cudaEventRecord(e1), "cudaEventRecord groupby_start");
-        groupby_selected_block_partial_kernel<kMaxPassengerCountKey><<<reduce_blocks, threads>>>(
-            d_fare, d_pc, d_selected_indices, d_selected_count, d_group_sum, d_group_count);
+        const std::size_t shmem_bytes =
+            static_cast<std::size_t>(num_groups) * (sizeof(double) + sizeof(unsigned long long));
+        groupby_selected_block_partial_kernel<<<reduce_blocks, threads, shmem_bytes>>>(
+            d_fare, d_pc, d_selected_indices, d_selected_count, d_group_sum, d_group_count,
+            static_cast<std::uint32_t>(num_groups));
         cuda_check(cudaGetLastError(), "groupby_selected_block_partial_kernel launch");
         cuda_check(cudaEventRecord(e2), "cudaEventRecord groupby_end");
         cuda_check(cudaEventSynchronize(e2), "cudaEventSynchronize groupby_end");
@@ -803,12 +810,11 @@ GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns,
         cuda_check(cudaEventRecord(e1), "cudaEventRecord d2h_start");
         cuda_check(cudaMemcpy(&last_selected, d_selected_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost),
                     "cudaMemcpy D2H selected_count");
-        cuda_check(cudaMemcpy(last.sum.data(), d_group_sum,
-                              static_cast<std::size_t>(kMaxPassengerCountKey) * sizeof(double),
+        cuda_check(cudaMemcpy(last.sum.data(), d_group_sum, static_cast<std::size_t>(num_groups) * sizeof(double),
                               cudaMemcpyDeviceToHost),
                    "cudaMemcpy D2H group_sum");
         cuda_check(cudaMemcpy(last.count.data(), d_group_count,
-                              static_cast<std::size_t>(kMaxPassengerCountKey) * sizeof(unsigned long long),
+                              static_cast<std::size_t>(num_groups) * sizeof(unsigned long long),
                               cudaMemcpyDeviceToHost),
                    "cudaMemcpy D2H group_count");
         cuda_check(cudaEventRecord(e2), "cudaEventRecord d2h_end");

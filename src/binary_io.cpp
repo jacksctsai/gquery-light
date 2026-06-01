@@ -7,6 +7,7 @@
 namespace gq {
 
 const char MAGIC_V2[4] = {'G', 'Q', '0', '2'};
+const char MAGIC_V3[4] = {'G', 'Q', '0', '3'};
 
 void write_binary(const std::filesystem::path& path, const Columns& columns, std::uint64_t rows) {
     std::ofstream out(path, std::ios::binary);
@@ -14,15 +15,16 @@ void write_binary(const std::filesystem::path& path, const Columns& columns, std
         throw std::runtime_error("Could not open file for writing: " + path.string());
     }
     
-    // Write V2 Magic Header
-    out.write(MAGIC_V2, sizeof(MAGIC_V2));
+    // Write V3 Magic Header
+    out.write(MAGIC_V3, sizeof(MAGIC_V3));
 
     // Header: uint64_t row_count;
     out.write(reinterpret_cast<const char*>(&rows), sizeof(rows));
     
     // Then raw arrays:
-    // uint8_t passenger_count[row_count];
-    out.write(reinterpret_cast<const char*>(columns.passenger_count.data()), static_cast<std::streamsize>(rows * sizeof(std::uint8_t)));
+    // uint32_t passenger_count[row_count];
+    out.write(reinterpret_cast<const char*>(columns.passenger_count.data()),
+              static_cast<std::streamsize>(rows * sizeof(std::uint32_t)));
 
     // float trip_distance[row_count];
     out.write(reinterpret_cast<const char*>(columns.trip_distance.data()), static_cast<std::streamsize>(rows * sizeof(float)));
@@ -40,12 +42,13 @@ BinaryReadResult read_binary(const std::filesystem::path& path) {
     char magic[4] = {0};
     in.read(magic, sizeof(magic));
     
-    bool is_v2 = (std::memcmp(magic, MAGIC_V2, sizeof(magic)) == 0);
+    const bool is_v3 = (std::memcmp(magic, MAGIC_V3, sizeof(magic)) == 0);
+    const bool is_v2 = (std::memcmp(magic, MAGIC_V2, sizeof(magic)) == 0);
     
     std::uint64_t rows = 0;
-    if (is_v2) {
+    if (is_v3 || is_v2) {
         if (!in.read(reinterpret_cast<char*>(&rows), sizeof(rows))) {
-            throw std::runtime_error("Could not read row count from V2 binary file: " + path.string());
+            throw std::runtime_error("Could not read row count from V2/V3 binary file: " + path.string());
         }
     } else {
         // Fallback to V1 where the first 8 bytes were the row count
@@ -63,9 +66,19 @@ BinaryReadResult read_binary(const std::filesystem::path& path) {
     columns.trip_distance.resize(rows);
     columns.fare_amount.resize(rows);
     
-    if (is_v2) {
-        if (!in.read(reinterpret_cast<char*>(columns.passenger_count.data()), static_cast<std::streamsize>(rows * sizeof(std::uint8_t)))) {
-            throw std::runtime_error("Could not read passenger_count array from binary file: " + path.string());
+    if (is_v3) {
+        if (!in.read(reinterpret_cast<char*>(columns.passenger_count.data()),
+                     static_cast<std::streamsize>(rows * sizeof(std::uint32_t)))) {
+            throw std::runtime_error("Could not read passenger_count array (u32) from V3 binary file: " + path.string());
+        }
+    } else if (is_v2) {
+        std::vector<std::uint8_t> pc8;
+        pc8.resize(rows);
+        if (!in.read(reinterpret_cast<char*>(pc8.data()), static_cast<std::streamsize>(rows * sizeof(std::uint8_t)))) {
+            throw std::runtime_error("Could not read passenger_count array (u8) from V2 binary file: " + path.string());
+        }
+        for (std::uint64_t i = 0; i < rows; ++i) {
+            columns.passenger_count[static_cast<std::size_t>(i)] = static_cast<std::uint32_t>(pc8[static_cast<std::size_t>(i)]);
         }
     }
 

@@ -12,9 +12,7 @@
 
 namespace gq {
 
-// GROUP BY SUM(fare_amount) keyed by passenger_count: supported keys are
-// integers in [0, kMaxPassengerCountKey). Keys outside this range are skipped on GPU / tracked on CPU reference.
-inline constexpr int kMaxPassengerCountKey = 9;
+// NOTE: Month 3 benchmark makes GROUP BY cardinality configurable at runtime.
 
 struct Row {
     float trip_distance{};
@@ -61,13 +59,15 @@ inline bool operator!=(const CudaPinnedAllocator<T>&, const CudaPinnedAllocator<
 
 using HostFloatVector = std::vector<float, CudaPinnedAllocator<float>>;
 using HostUint8Vector = std::vector<std::uint8_t, CudaPinnedAllocator<std::uint8_t>>;
+using HostUint32Vector = std::vector<std::uint32_t, CudaPinnedAllocator<std::uint32_t>>;
 #else
 using HostFloatVector = std::vector<float>;
 using HostUint8Vector = std::vector<std::uint8_t>;
+using HostUint32Vector = std::vector<std::uint32_t>;
 #endif
 
 struct Columns {
-    HostUint8Vector passenger_count;
+    HostUint32Vector passenger_count;
     HostFloatVector trip_distance;
     HostFloatVector fare_amount;
 };
@@ -78,16 +78,16 @@ struct Result {
 };
 
 struct GroupByPassengerFilteredResult {
-    std::array<std::uint64_t, static_cast<std::size_t>(kMaxPassengerCountKey)> count{};
-    std::array<double, static_cast<std::size_t>(kMaxPassengerCountKey)> sum{};
+    std::vector<std::uint64_t> count;
+    std::vector<double> sum;
     std::uint64_t selected_matching_rows{};
-    /** Matching predicate but passenger_count outside [0, kMaxPassengerCountKey). */
+    /** Matching predicate but passenger_count outside [0, num_groups). */
     std::uint64_t out_of_range_selected_rows{};
 };
 
 struct GroupByGpuTable {
-    std::array<std::uint64_t, static_cast<std::size_t>(kMaxPassengerCountKey)> count{};
-    std::array<double, static_cast<std::size_t>(kMaxPassengerCountKey)> sum{};
+    std::vector<std::uint64_t> count;
+    std::vector<double> sum;
 };
 
 } // namespace gq

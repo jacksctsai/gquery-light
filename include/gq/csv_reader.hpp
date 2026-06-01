@@ -38,13 +38,13 @@ private:
     static void extract_target_fields(
         const std::string& line,
         const CsvLayout& layout,
-        std::uint8_t& passenger_count,
+        std::uint32_t& passenger_count,
         float& trip_distance,
         float& fare_amount,
         std::uint64_t line_number);
 
     static float parse_float_token(const std::string& line, std::size_t start, std::size_t end, const char* column_name, std::uint64_t line_number);
-    static std::uint8_t parse_uint8_token(const std::string& line, std::size_t start, std::size_t end, const char* column_name, std::uint64_t line_number);
+    static std::uint32_t parse_uint32_token(const std::string& line, std::size_t start, std::size_t end, const char* column_name, std::uint64_t line_number);
 };
 
 } // namespace gq

@@ -6,6 +6,8 @@
 #include <string>
 #include <filesystem>
 #include <map>
+#include <random>
+#include <vector>
 
 #include "gq/csv_reader.hpp"
 #include "gq/filter_cpu.hpp"
@@ -17,11 +19,12 @@
 #endif
 
 #ifdef GQUERY_USE_CUDA
-/** Distinct buckets in [0, kMaxPassengerCountKey) with nonzero CPU COUNT after filtering. */
+/** Distinct buckets in [0, num_groups) with nonzero CPU COUNT after filtering. */
 int count_nonempty_groupby_buckets(const gq::GroupByPassengerFilteredResult& gb) {
     int c = 0;
-    for (int key = 0; key < gq::kMaxPassengerCountKey; ++key) {
-        if (gb.count[static_cast<std::size_t>(key)] != 0U) {
+    const std::size_t n = gb.count.size();
+    for (std::size_t key = 0; key < n; ++key) {
+        if (gb.count[key] != 0U) {
             ++c;
         }
     }
@@ -32,14 +35,19 @@ void print_groupby_per_key_correctness(const gq::GroupByPassengerFilteredResult&
     constexpr double kAbsEps = 1e-9;
     constexpr double kRelEps = 1e-9;
 
-    std::cout << "\n--- Per-key GROUP BY (passenger_count in [0, " << (gq::kMaxPassengerCountKey - 1) << "]) ---\n";
+    if (cpu.count.size() != gpu.count.size() || cpu.sum.size() != gpu.sum.size()) {
+        std::cout << "error: CPU/GPU GROUP BY shape mismatch\n";
+        return;
+    }
+
+    const std::size_t num_groups = cpu.count.size();
+    std::cout << "\n--- Per-key GROUP BY (keys in [0, " << (num_groups == 0 ? 0 : (num_groups - 1)) << "]) ---\n";
     std::cout << std::setw(6) << "key" << " | " << std::setw(10) << "cpu_count" << " " << std::setw(10) << "gpu_count"
               << " " << std::setw(12) << "count_delta" << " | " << std::setw(14) << "cpu_sum" << " " << std::setw(14)
               << "gpu_sum" << " " << std::setw(14) << "sum_delta" << " | " << std::setw(8) << "correct" << "\n";
 
     bool all_ok = true;
-    for (int key = 0; key < gq::kMaxPassengerCountKey; ++key) {
-        const std::size_t b = static_cast<std::size_t>(key);
+    for (std::size_t b = 0; b < num_groups; ++b) {
         const std::uint64_t cc = cpu.count[b];
         const std::uint64_t gc = gpu.count[b];
         const double cs = cpu.sum[b];
@@ -56,7 +64,7 @@ void print_groupby_per_key_correctness(const gq::GroupByPassengerFilteredResult&
             all_ok = false;
         }
 
-        std::cout << std::setw(6) << key << " | " << std::setw(10) << cc << " " << std::setw(10) << gc << " "
+        std::cout << std::setw(6) << b << " | " << std::setw(10) << cc << " " << std::setw(10) << gc << " "
                   << std::setw(12) << count_delta << " | " << std::setw(14) << std::fixed << std::setprecision(7) << cs
                   << " " << std::setw(14) << gs << " " << std::setw(14) << sum_delta << " | " << std::setw(8)
                   << (row_ok ? "1" : "0") << "\n";
@@ -69,7 +77,7 @@ void print_groupby_per_key_correctness(const gq::GroupByPassengerFilteredResult&
 void print_runbin_gpu_groupby_metrics(std::uint64_t file_bytes, std::uint64_t rows, int iterations, double load_ms,
                                       int threads_per_block, const gq::FilterGpuMetrics& gpu, double total_ms,
                                       const std::string& mode_csv, const std::string& groupby_algorithm_label) {
-    const std::uint64_t payload_bytes = rows * (2 * sizeof(float) + sizeof(std::uint8_t));
+    const std::uint64_t payload_bytes = rows * (2 * sizeof(float) + sizeof(std::uint32_t));
     const double load_seconds = load_ms / 1000.0;
     const double load_gb_per_s = load_seconds > 0.0 ? (static_cast<double>(file_bytes) / load_seconds / 1e9) : 0.0;
 
@@ -134,11 +142,11 @@ void print_cardinality(const gq::CardinalityResult& card) {
     std::cout << "\n--- Passenger Count Cardinality ---\n";
     std::cout << "Distinct Keys: " << card.counts.size() << "\n";
     if (!card.counts.empty()) {
-        std::cout << "Min Key: " << static_cast<int>(card.min_key) << "\n";
-        std::cout << "Max Key: " << static_cast<int>(card.max_key) << "\n";
+        std::cout << "Min Key: " << card.min_key << "\n";
+        std::cout << "Max Key: " << card.max_key << "\n";
         std::cout << "Counts:\n";
         for (const auto& [k, v] : card.counts) {
-            std::cout << "  " << static_cast<int>(k) << ": " << v << "\n";
+            std::cout << "  " << k << ": " << v << "\n";
         }
     }
     std::cout << "-----------------------------------\n";
@@ -332,19 +340,225 @@ void print_cpu_gpu_correctness(const gq::Result& cpu, const gq::Result& gpu) {
 
 #endif
 
+enum class Distribution { Uniform, Hotkey, Zipf };
+enum class ReductionMode { Atomic, BlockPartial };
+
+struct BenchmarkConfig {
+    std::size_t num_rows = 12'000'000;
+    int num_groups = 1024;
+    Distribution distribution = Distribution::Uniform;
+    ReductionMode mode = ReductionMode::BlockPartial;
+    int warmup = 3;
+    int iterations = 10;
+    int seed = 42;
+    bool validate = true;
+    int threads_per_block = 256;
+};
+
+static const char* to_string(Distribution d) {
+    switch (d) {
+        case Distribution::Uniform: return "uniform";
+        case Distribution::Hotkey: return "hotkey";
+        case Distribution::Zipf: return "zipf";
+    }
+    return "unknown";
+}
+
+static const char* to_string(ReductionMode m) {
+    switch (m) {
+        case ReductionMode::Atomic: return "atomic";
+        case ReductionMode::BlockPartial: return "block-partial";
+    }
+    return "unknown";
+}
+
+static void print_usage(const char* argv0) {
+    std::cerr << "Usage:\n"
+              << "  " << argv0 << " [options]\n"
+              << "  " << argv0 << " csv2bin <input.csv> <output.bin>\n"
+              << "  " << argv0 << " runbin <input.bin> <iterations>\n"
+              << "  " << argv0 << " runbin_gpu_atomic <input.bin> [iterations] [threads_per_block]\n"
+              << "  " << argv0 << " runbin_gpu_groupby_atomic <input.bin> [iterations] [threads_per_block]\n"
+              << "  " << argv0 << " runbin_gpu_groupby_block_partial <input.bin> [iterations] [threads_per_block]\n"
+              << "  " << argv0 << " runbin_gpu_mask_atomic <input.bin> [iterations] [threads_per_block]\n"
+              << "  " << argv0 << " runbin_gpu_mask_block_partial <input.bin> [iterations] [threads_per_block]\n"
+              << "  " << argv0 << " runbin_gpu_mask <input.bin> [iterations] [threads_per_block]\n"
+              << "  " << argv0 << " <input.csv> [iterations]\n\n"
+              << "Options (synthetic GPU GROUP BY benchmark):\n"
+              << "  --num-rows N                 Number of logical input rows\n"
+              << "  --num-groups N               Number of group keys\n"
+              << "  --distribution uniform|hotkey|zipf\n"
+              << "  --mode atomic|block-partial\n"
+              << "  --warmup N\n"
+              << "  --iterations N\n"
+              << "  --seed N\n"
+              << "  --validate true|false\n"
+              << "  --threads-per-block N\n"
+              << "  --help\n";
+}
+
+static bool parse_bool(const std::string& s) {
+    if (s == "true" || s == "1") return true;
+    if (s == "false" || s == "0") return false;
+    throw std::runtime_error("invalid bool: " + s);
+}
+
+static BenchmarkConfig parseArgs(int argc, char** argv) {
+    BenchmarkConfig cfg{};
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        auto need_value = [&](const char* name) -> std::string {
+            if (i + 1 >= argc) {
+                throw std::runtime_error(std::string("missing value for ") + name);
+            }
+            return std::string(argv[++i]);
+        };
+
+        if (arg == "--help" || arg == "-h") {
+            print_usage(argv[0]);
+            std::exit(0);
+        } else if (arg == "--num-rows") {
+            cfg.num_rows = static_cast<std::size_t>(std::stoull(need_value("--num-rows")));
+        } else if (arg == "--num-groups") {
+            cfg.num_groups = std::stoi(need_value("--num-groups"));
+        } else if (arg == "--distribution") {
+            const std::string v = need_value("--distribution");
+            if (v == "uniform") cfg.distribution = Distribution::Uniform;
+            else if (v == "hotkey") cfg.distribution = Distribution::Hotkey;
+            else if (v == "zipf") cfg.distribution = Distribution::Zipf;
+            else throw std::runtime_error("unknown --distribution: " + v);
+        } else if (arg == "--mode") {
+            const std::string v = need_value("--mode");
+            if (v == "atomic") cfg.mode = ReductionMode::Atomic;
+            else if (v == "block-partial") cfg.mode = ReductionMode::BlockPartial;
+            else throw std::runtime_error("unknown --mode: " + v);
+        } else if (arg == "--warmup") {
+            cfg.warmup = std::stoi(need_value("--warmup"));
+        } else if (arg == "--iterations") {
+            cfg.iterations = std::stoi(need_value("--iterations"));
+        } else if (arg == "--seed") {
+            cfg.seed = std::stoi(need_value("--seed"));
+        } else if (arg == "--validate") {
+            cfg.validate = parse_bool(need_value("--validate"));
+        } else if (arg == "--threads-per-block") {
+            cfg.threads_per_block = std::stoi(need_value("--threads-per-block"));
+        } else if (arg.rfind("--", 0) == 0) {
+            throw std::runtime_error("unknown option: " + arg);
+        }
+    }
+
+    if (cfg.num_rows == 0) throw std::runtime_error("--num-rows must be > 0");
+    if (cfg.num_groups <= 0) throw std::runtime_error("--num-groups must be > 0");
+    if (cfg.warmup < 0) throw std::runtime_error("--warmup must be >= 0");
+    if (cfg.iterations <= 0) throw std::runtime_error("--iterations must be > 0");
+    if (cfg.threads_per_block <= 0) throw std::runtime_error("--threads-per-block must be > 0");
+    return cfg;
+}
+
+static void printConfig(const BenchmarkConfig& cfg) {
+    std::cout << "G-Query Light Benchmark Config\n";
+    std::cout << "num_rows:     " << cfg.num_rows << "\n";
+    std::cout << "num_groups:   " << cfg.num_groups << "\n";
+    std::cout << "distribution: " << to_string(cfg.distribution) << "\n";
+    std::cout << "mode:         " << to_string(cfg.mode) << "\n";
+    std::cout << "warmup:       " << cfg.warmup << "\n";
+    std::cout << "iterations:   " << cfg.iterations << "\n";
+    std::cout << "seed:         " << cfg.seed << "\n";
+    std::cout << "validate:     " << (cfg.validate ? "true" : "false") << "\n";
+    std::cout << "threads_per_block: " << cfg.threads_per_block << "\n";
+}
+
+static gq::Columns generateDataset(const BenchmarkConfig& cfg) {
+    gq::Columns cols;
+    cols.passenger_count.resize(cfg.num_rows);
+    cols.trip_distance.resize(cfg.num_rows);
+    cols.fare_amount.resize(cfg.num_rows);
+
+    std::mt19937 rng(static_cast<std::uint32_t>(cfg.seed));
+    std::uniform_real_distribution<float> td_dist(0.0f, 6.0f);
+    std::uniform_real_distribution<float> fa_dist(0.0f, 25.0f);
+    std::uniform_int_distribution<std::uint32_t> key_all(0U, static_cast<std::uint32_t>(cfg.num_groups - 1));
+    std::uniform_int_distribution<std::uint32_t> key_cold(1U, static_cast<std::uint32_t>(std::max(cfg.num_groups - 1, 1)));
+    std::uniform_real_distribution<float> p01(0.0f, 1.0f);
+
+    for (std::size_t i = 0; i < cfg.num_rows; ++i) {
+        cols.trip_distance[i] = td_dist(rng);
+        cols.fare_amount[i] = fa_dist(rng);
+        std::uint32_t k = 0;
+        switch (cfg.distribution) {
+            case Distribution::Uniform:
+                k = key_all(rng);
+                break;
+            case Distribution::Hotkey:
+                k = (p01(rng) < 0.90f) ? 0U : key_cold(rng);
+                break;
+            case Distribution::Zipf:
+                throw std::runtime_error("zipf distribution not implemented yet");
+        }
+        cols.passenger_count[i] = k;
+    }
+    return cols;
+}
+
 int main(int argc, char** argv) {
     try {
+        // Synthetic benchmark mode: any --options triggers config parsing.
+        for (int i = 1; i < argc; ++i) {
+            if (std::string(argv[i]).rfind("--", 0) == 0) {
+#ifndef GQUERY_USE_CUDA
+                std::cerr << "error: CUDA not enabled in this build\n";
+                return 1;
+#else
+                BenchmarkConfig cfg = parseArgs(argc, argv);
+                printConfig(cfg);
+
+                gq::CpuTimer gen_timer;
+                gq::Columns dataset = generateDataset(cfg);
+                const double gen_ms = gen_timer.elapsed_ms();
+                std::cout << "data_generation_ms: " << std::fixed << std::setprecision(4) << gen_ms << "\n";
+
+                // Warmup (not included in measured metrics)
+                if (cfg.warmup > 0) {
+                    gq::FilterGpuMetrics warm_metrics{};
+                    if (cfg.mode == ReductionMode::Atomic) {
+                        (void)gq::filter_groupby_gpu_atomic_baseline(dataset, cfg.warmup, warm_metrics,
+                                                                     static_cast<std::size_t>(cfg.num_groups),
+                                                                     cfg.threads_per_block);
+                    } else {
+                        (void)gq::filter_groupby_gpu_compact_block_partial(dataset, cfg.warmup, warm_metrics,
+                                                                           static_cast<std::size_t>(cfg.num_groups),
+                                                                           cfg.threads_per_block);
+                    }
+                }
+
+                // Measured iterations
+                gq::FilterGpuMetrics gpu_metrics{};
+                gq::GroupByGpuTable gpu_gb{};
+                if (cfg.mode == ReductionMode::Atomic) {
+                    gpu_gb = gq::filter_groupby_gpu_atomic_baseline(dataset, cfg.iterations, gpu_metrics,
+                                                                    static_cast<std::size_t>(cfg.num_groups),
+                                                                    cfg.threads_per_block);
+                } else {
+                    gpu_gb = gq::filter_groupby_gpu_compact_block_partial(dataset, cfg.iterations, gpu_metrics,
+                                                                          static_cast<std::size_t>(cfg.num_groups),
+                                                                          cfg.threads_per_block);
+                }
+
+                std::cout << "avg_total_gpu_ms: " << std::fixed << std::setprecision(4) << gpu_metrics.total_gpu_ms << "\n";
+
+                if (cfg.validate) {
+                    const gq::GroupByPassengerFilteredResult cpu_gb =
+                        gq::filter_groupby_passenger_count_soa(dataset, static_cast<std::size_t>(cfg.num_groups));
+                    gpu_metrics.key_cardinality = count_nonempty_groupby_buckets(cpu_gb);
+                    print_groupby_per_key_correctness(cpu_gb, gpu_gb);
+                }
+                return 0;
+#endif
+            }
+        }
+
         if (argc < 2) {
-            std::cerr << "Usage: \n"
-                      << "  " << argv[0] << " csv2bin <input.csv> <output.bin>\n"
-                      << "  " << argv[0] << " runbin <input.bin> <iterations>\n"
-                      << "  " << argv[0] << " runbin_gpu_atomic <input.bin> [iterations] [threads_per_block]\n"
-                      << "  " << argv[0] << " runbin_gpu_groupby_atomic <input.bin> [iterations] [threads_per_block]\n"
-                      << "  " << argv[0] << " runbin_gpu_groupby_block_partial <input.bin> [iterations] [threads_per_block]\n"
-                      << "  " << argv[0] << " runbin_gpu_mask_atomic <input.bin> [iterations] [threads_per_block]\n"
-                      << "  " << argv[0] << " runbin_gpu_mask_block_partial <input.bin> [iterations] [threads_per_block]\n"
-                      << "  " << argv[0] << " runbin_gpu_mask <input.bin> [iterations] [threads_per_block]\n"
-                      << "  " << argv[0] << " <input.csv> [iterations]\n";
+            print_usage(argv[0]);
             return 1;
         }
 
@@ -418,11 +632,14 @@ int main(int argc, char** argv) {
             auto card = gq::compute_cardinality_soa(bin_result.columns);
             print_cardinality(card);
 
-            const gq::GroupByPassengerFilteredResult cpu_gb = gq::filter_groupby_passenger_count_soa(bin_result.columns);
+            const std::size_t num_groups = static_cast<std::size_t>(card.max_key) + 1U;
+            const gq::GroupByPassengerFilteredResult cpu_gb =
+                gq::filter_groupby_passenger_count_soa(bin_result.columns, num_groups);
 
             gq::FilterGpuMetrics gpu_metrics{};
             const gq::GroupByGpuTable gpu_gb =
-                gq::filter_groupby_gpu_atomic_baseline(bin_result.columns, iterations, gpu_metrics, threads_per_block);
+                gq::filter_groupby_gpu_atomic_baseline(bin_result.columns, iterations, gpu_metrics, num_groups,
+                                                       threads_per_block);
             const double total_ms = total_timer.elapsed_ms();
 
             gpu_metrics.max_key_observed = static_cast<int>(card.max_key);
@@ -430,8 +647,7 @@ int main(int argc, char** argv) {
 
             if (cpu_gb.out_of_range_selected_rows != 0U) {
                 std::cout << "note: WHERE matched " << cpu_gb.out_of_range_selected_rows
-                          << " row(s) with passenger_count outside [0," << gq::kMaxPassengerCountKey
-                          << "); those are omitted from GPU/CPU keyed aggregates above.\n";
+                          << " row(s) with key outside [0," << num_groups << "); omitted from keyed aggregates.\n";
             }
 
             print_runbin_gpu_groupby_metrics(bin_result.file_bytes, bin_result.rows, iterations, load_ms,
@@ -462,11 +678,13 @@ int main(int argc, char** argv) {
             auto card = gq::compute_cardinality_soa(bin_result.columns);
             print_cardinality(card);
 
-            const gq::GroupByPassengerFilteredResult cpu_gb = gq::filter_groupby_passenger_count_soa(bin_result.columns);
+            const std::size_t num_groups = static_cast<std::size_t>(card.max_key) + 1U;
+            const gq::GroupByPassengerFilteredResult cpu_gb =
+                gq::filter_groupby_passenger_count_soa(bin_result.columns, num_groups);
 
             gq::FilterGpuMetrics gpu_metrics{};
             const gq::GroupByGpuTable gpu_gb = gq::filter_groupby_gpu_compact_block_partial(
-                bin_result.columns, iterations, gpu_metrics, threads_per_block);
+                bin_result.columns, iterations, gpu_metrics, num_groups, threads_per_block);
             const double total_ms = total_timer.elapsed_ms();
 
             gpu_metrics.max_key_observed = static_cast<int>(card.max_key);
@@ -474,8 +692,7 @@ int main(int argc, char** argv) {
 
             if (cpu_gb.out_of_range_selected_rows != 0U) {
                 std::cout << "note: WHERE matched " << cpu_gb.out_of_range_selected_rows
-                          << " row(s) with passenger_count outside [0," << gq::kMaxPassengerCountKey
-                          << "); those are omitted from GPU/CPU keyed aggregates above.\n";
+                          << " row(s) with key outside [0," << num_groups << "); omitted from keyed aggregates.\n";
             }
 
             print_runbin_gpu_groupby_metrics(bin_result.file_bytes, bin_result.rows, iterations, load_ms,
