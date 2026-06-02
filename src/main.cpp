@@ -16,6 +16,7 @@
 
 #ifdef GQUERY_USE_CUDA
 #include "gq/filter_gpu.hpp"
+#include "nvtx_utils.h"
 #endif
 
 #ifdef GQUERY_USE_CUDA
@@ -510,43 +511,58 @@ int main(int argc, char** argv) {
                 return 1;
 #else
                 BenchmarkConfig cfg = parseArgs(argc, argv);
+                NvtxRange program_range("program_total");
                 printConfig(cfg);
 
-                gq::CpuTimer gen_timer;
-                gq::Columns dataset = generateDataset(cfg);
-                const double gen_ms = gen_timer.elapsed_ms();
+                gq::Columns dataset;
+                double gen_ms = 0.0;
+                {
+                    NvtxRange gen_range("cpu_generate_input");
+                    gq::CpuTimer gen_timer;
+                    dataset = generateDataset(cfg);
+                    gen_ms = gen_timer.elapsed_ms();
+                }
                 std::cout << "data_generation_ms: " << std::fixed << std::setprecision(4) << gen_ms << "\n";
 
                 // Warmup (not included in measured metrics)
                 if (cfg.warmup > 0) {
+                    NvtxRange warmup_range("benchmark_warmup");
                     gq::FilterGpuMetrics warm_metrics{};
                     if (cfg.mode == ReductionMode::Atomic) {
                         (void)gq::filter_groupby_gpu_atomic_baseline(dataset, cfg.warmup, warm_metrics,
                                                                      static_cast<std::size_t>(cfg.num_groups),
-                                                                     cfg.threads_per_block);
+                                                                     cfg.threads_per_block, "warmup_iteration");
                     } else {
                         (void)gq::filter_groupby_gpu_compact_block_partial(dataset, cfg.warmup, warm_metrics,
                                                                            static_cast<std::size_t>(cfg.num_groups),
-                                                                           cfg.threads_per_block);
+                                                                           cfg.threads_per_block, "warmup_iteration");
                     }
                 }
 
                 // Measured iterations
                 gq::FilterGpuMetrics gpu_metrics{};
                 gq::GroupByGpuTable gpu_gb{};
-                if (cfg.mode == ReductionMode::Atomic) {
-                    gpu_gb = gq::filter_groupby_gpu_atomic_baseline(dataset, cfg.iterations, gpu_metrics,
-                                                                    static_cast<std::size_t>(cfg.num_groups),
-                                                                    cfg.threads_per_block);
-                } else {
-                    gpu_gb = gq::filter_groupby_gpu_compact_block_partial(dataset, cfg.iterations, gpu_metrics,
-                                                                          static_cast<std::size_t>(cfg.num_groups),
-                                                                          cfg.threads_per_block);
+                {
+                    NvtxRange measured_range("benchmark_measured_iterations");
+                    if (cfg.mode == ReductionMode::Atomic) {
+                        gpu_gb = gq::filter_groupby_gpu_atomic_baseline(dataset, cfg.iterations, gpu_metrics,
+                                                                        static_cast<std::size_t>(cfg.num_groups),
+                                                                        cfg.threads_per_block, "measured_iteration");
+                    } else {
+                        gpu_gb = gq::filter_groupby_gpu_compact_block_partial(
+                            dataset, cfg.iterations, gpu_metrics, static_cast<std::size_t>(cfg.num_groups),
+                            cfg.threads_per_block, "measured_iteration");
+                    }
                 }
 
-                std::cout << "avg_total_gpu_ms: " << std::fixed << std::setprecision(4) << gpu_metrics.total_gpu_ms << "\n";
+                {
+                    NvtxRange summary_range("timing_summary");
+                    std::cout << "avg_total_gpu_ms: " << std::fixed << std::setprecision(4) << gpu_metrics.total_gpu_ms
+                              << "\n";
+                }
 
                 if (cfg.validate) {
+                    NvtxRange validate_range("cpu_validate");
                     const gq::GroupByPassengerFilteredResult cpu_gb =
                         gq::filter_groupby_passenger_count_soa(dataset, static_cast<std::size_t>(cfg.num_groups));
                     gpu_metrics.key_cardinality = count_nonempty_groupby_buckets(cpu_gb);

@@ -48,8 +48,28 @@ endif()
 if(CUDA_ENABLED)
     target_compile_definitions(gquery PRIVATE GQUERY_USE_CUDA)
     # Needed because `gquery` C++ sources include CUDA runtime headers (pinned host allocator).
-    target_include_directories(gquery PRIVATE /usr/local/cuda/include)
+    target_include_directories(gquery PRIVATE /usr/local/cuda/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
     # See README: match GQUERY_CUDA_ARCH to your GPU (e.g. 75 for compute capability 7.5) or use native locally.
     set(GQUERY_CUDA_ARCH "80" CACHE STRING "CUDA sm_XX (e.g. 75, 80, 89) or native")
     set_target_properties(gquery PROPERTIES CUDA_ARCHITECTURES "${GQUERY_CUDA_ARCH}")
+
+    option(ENABLE_NVTX "Enable NVTX instrumentation for Nsight Systems" ON)
+    if(ENABLE_NVTX)
+        find_library(GQUERY_NVTX_LIB nvToolsExt
+            PATHS
+                /usr/local/cuda/lib64
+                /usr/local/cuda/lib
+                "${CUDAToolkit_LIBRARY_DIR}"
+            NO_DEFAULT_PATH)
+        if(NOT GQUERY_NVTX_LIB)
+            find_library(GQUERY_NVTX_LIB nvToolsExt)
+        endif()
+        if(GQUERY_NVTX_LIB)
+            target_compile_definitions(gquery PRIVATE ENABLE_NVTX)
+            target_link_libraries(gquery PRIVATE ${GQUERY_NVTX_LIB})
+            message(STATUS "NVTX enabled: ${GQUERY_NVTX_LIB}")
+        else()
+            message(WARNING "ENABLE_NVTX is ON but nvToolsExt was not found; building without NVTX")
+        endif()
+    endif()
 endif()

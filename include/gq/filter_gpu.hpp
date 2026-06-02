@@ -62,12 +62,14 @@ Result filter_and_sum_gpu_compact_block_partial(const Columns& columns, int iter
  * filter_ms/scan_ms/scatter_ms are zero; work is recorded in groupby_ms.
  */
 GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int iterations, FilterGpuMetrics& metrics,
-                                                  std::size_t num_groups, int threads_per_block = 256);
+                                                  std::size_t num_groups, int threads_per_block = 256,
+                                                  const char* nvtx_iteration_prefix = nullptr);
 
 /**
  * Filter + compact + block-local partial GROUP BY with a final global merge (atomics on key slots).
  */
 GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns, int iterations, FilterGpuMetrics& metrics,
-                                                         std::size_t num_groups, int threads_per_block = 256);
+                                                         std::size_t num_groups, int threads_per_block = 256,
+                                                         const char* nvtx_iteration_prefix = nullptr);
 
 } // namespace gq
