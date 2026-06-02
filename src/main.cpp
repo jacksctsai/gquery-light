@@ -16,6 +16,7 @@
 
 #ifdef GQUERY_USE_CUDA
 #include "gq/filter_gpu.hpp"
+#include "gq/pipeline_timing.hpp"
 #include "nvtx_utils.h"
 #endif
 
@@ -541,24 +542,29 @@ int main(int argc, char** argv) {
 
                 // Measured iterations
                 gq::FilterGpuMetrics gpu_metrics{};
+                gq::TimingStats timing_stats{};
                 gq::GroupByGpuTable gpu_gb{};
+                const gq::PipelineTimingMode timing_mode =
+                    (cfg.mode == ReductionMode::Atomic) ? gq::PipelineTimingMode::Atomic
+                                                        : gq::PipelineTimingMode::BlockPartial;
                 {
                     NvtxRange measured_range("benchmark_measured_iterations");
                     if (cfg.mode == ReductionMode::Atomic) {
                         gpu_gb = gq::filter_groupby_gpu_atomic_baseline(dataset, cfg.iterations, gpu_metrics,
                                                                         static_cast<std::size_t>(cfg.num_groups),
-                                                                        cfg.threads_per_block, "measured_iteration");
+                                                                        cfg.threads_per_block, "measured_iteration",
+                                                                        &timing_stats);
                     } else {
                         gpu_gb = gq::filter_groupby_gpu_compact_block_partial(
                             dataset, cfg.iterations, gpu_metrics, static_cast<std::size_t>(cfg.num_groups),
-                            cfg.threads_per_block, "measured_iteration");
+                            cfg.threads_per_block, "measured_iteration", &timing_stats);
                     }
                 }
 
                 {
                     NvtxRange summary_range("timing_summary");
-                    std::cout << "avg_total_gpu_ms: " << std::fixed << std::setprecision(4) << gpu_metrics.total_gpu_ms
-                              << "\n";
+                    gq::print_pipeline_timing_summary(timing_stats, timing_mode);
+                    gpu_metrics.total_gpu_ms = timing_stats.avg_total_gpu_ms();
                 }
 
                 if (cfg.validate) {

@@ -1,4 +1,5 @@
 #include "gq/filter_gpu.hpp"
+#include "gq/pipeline_timing.hpp"
 #include "nvtx_utils.h"
 
 #include <cuda_runtime.h>
@@ -39,6 +40,47 @@ inline double elapsed_ms(cudaEvent_t start, cudaEvent_t end, const char* what) {
     float ms = 0.0F;
     cuda_check(cudaEventElapsedTime(&ms, start, end), what);
     return static_cast<double>(ms);
+}
+
+inline void event_create(cudaEvent_t& e) {
+    cuda_check(cudaEventCreate(&e), "cudaEventCreate");
+}
+
+inline void event_destroy(cudaEvent_t e) {
+    cudaEventDestroy(e);
+}
+
+inline void record_pipeline_timing_atomic(cudaEvent_t total_start, cudaEvent_t total_stop, cudaEvent_t h2d_start,
+                                          cudaEvent_t h2d_stop, cudaEvent_t atomic_start, cudaEvent_t atomic_stop,
+                                          cudaEvent_t d2h_start, cudaEvent_t d2h_stop, PipelineTiming& timing) {
+    cuda_check(cudaEventSynchronize(total_stop), "cudaEventSynchronize total_stop");
+    timing.total_gpu_ms = elapsed_ms(total_start, total_stop, "cudaEventElapsedTime total");
+    timing.h2d_ms = elapsed_ms(h2d_start, h2d_stop, "cudaEventElapsedTime h2d");
+    timing.filter_kernel_ms = 0.0;
+    timing.scan_kernel_ms = 0.0;
+    timing.scatter_kernel_ms = 0.0;
+    timing.atomic_groupby_kernel_ms = elapsed_ms(atomic_start, atomic_stop, "cudaEventElapsedTime atomic_groupby");
+    timing.block_partial_reduce_kernel_ms = 0.0;
+    timing.final_reduce_kernel_ms = 0.0;
+    timing.d2h_ms = elapsed_ms(d2h_start, d2h_stop, "cudaEventElapsedTime d2h");
+}
+
+inline void record_pipeline_timing_block_partial(cudaEvent_t total_start, cudaEvent_t total_stop, cudaEvent_t h2d_start,
+                                                 cudaEvent_t h2d_stop, cudaEvent_t filter_start, cudaEvent_t filter_stop,
+                                                 cudaEvent_t scan_start, cudaEvent_t scan_stop, cudaEvent_t scatter_start,
+                                                 cudaEvent_t scatter_stop, cudaEvent_t reduce_start, cudaEvent_t reduce_stop,
+                                                 cudaEvent_t d2h_start, cudaEvent_t d2h_stop, PipelineTiming& timing) {
+    cuda_check(cudaEventSynchronize(total_stop), "cudaEventSynchronize total_stop");
+    timing.total_gpu_ms = elapsed_ms(total_start, total_stop, "cudaEventElapsedTime total");
+    timing.h2d_ms = elapsed_ms(h2d_start, h2d_stop, "cudaEventElapsedTime h2d");
+    timing.filter_kernel_ms = elapsed_ms(filter_start, filter_stop, "cudaEventElapsedTime filter");
+    timing.scan_kernel_ms = elapsed_ms(scan_start, scan_stop, "cudaEventElapsedTime scan");
+    timing.scatter_kernel_ms = elapsed_ms(scatter_start, scatter_stop, "cudaEventElapsedTime scatter");
+    timing.atomic_groupby_kernel_ms = 0.0;
+    timing.block_partial_reduce_kernel_ms =
+        elapsed_ms(reduce_start, reduce_stop, "cudaEventElapsedTime block_partial_reduce");
+    timing.final_reduce_kernel_ms = 0.0;
+    timing.d2h_ms = elapsed_ms(d2h_start, d2h_stop, "cudaEventElapsedTime d2h");
 }
 
 inline const char* nvtx_iter_prefix_or_default(const char* prefix) {
@@ -528,7 +570,7 @@ Result filter_and_sum_gpu_compact_block_partial(const Columns& columns, int iter
 
 GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int iterations, FilterGpuMetrics& metrics,
                                                    std::size_t num_groups, int threads_per_block,
-                                                   const char* nvtx_iteration_prefix) {
+                                                   const char* nvtx_iteration_prefix, TimingStats* measured_timing) {
     if (iterations < 1) {
         throw std::runtime_error("iterations must be >= 1");
     }
@@ -581,8 +623,22 @@ GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int i
                    "cudaMalloc d_pred_match");
     }
 
-    cudaEvent_t e0{}, e1{}, e2{}, e3{};
-    events_create(e0, e1, e2, e3);
+    cudaEvent_t total_start{};
+    cudaEvent_t total_stop{};
+    cudaEvent_t h2d_start{};
+    cudaEvent_t h2d_stop{};
+    cudaEvent_t atomic_start{};
+    cudaEvent_t atomic_stop{};
+    cudaEvent_t d2h_start{};
+    cudaEvent_t d2h_stop{};
+    event_create(total_start);
+    event_create(total_stop);
+    event_create(h2d_start);
+    event_create(h2d_stop);
+    event_create(atomic_start);
+    event_create(atomic_stop);
+    event_create(d2h_start);
+    event_create(d2h_stop);
 
     double acc_h2d = 0.0;
     double acc_groupby = 0.0;
@@ -606,9 +662,9 @@ GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int i
                     "cudaMemset d_group_count");
         cuda_check(cudaMemset(d_pred_match, 0, sizeof(unsigned long long)), "cudaMemset d_pred_match");
 
-        cuda_check(cudaEventRecord(e0), "cudaEventRecord total_start");
+        cuda_check(cudaEventRecord(total_start), "cudaEventRecord total_start");
 
-        cuda_check(cudaEventRecord(e1), "cudaEventRecord h2d_start");
+        cuda_check(cudaEventRecord(h2d_start), "cudaEventRecord h2d_start");
         {
             NvtxRange h2d_range("h2d_transfer");
             cuda_check(cudaMemcpy(d_trip, columns.trip_distance.data(), bytes_float_col, cudaMemcpyHostToDevice),
@@ -618,11 +674,9 @@ GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int i
             cuda_check(cudaMemcpy(d_pc, columns.passenger_count.data(), bytes_pc, cudaMemcpyHostToDevice),
                         "cudaMemcpy H2D passenger_count");
         }
-        cuda_check(cudaEventRecord(e2), "cudaEventRecord h2d_end");
-        cuda_check(cudaEventSynchronize(e2), "cudaEventSynchronize h2d_end");
-        acc_h2d += elapsed_ms(e1, e2, "cudaEventElapsedTime h2d");
+        cuda_check(cudaEventRecord(h2d_stop), "cudaEventRecord h2d_stop");
 
-        cuda_check(cudaEventRecord(e1), "cudaEventRecord groupby_start");
+        cuda_check(cudaEventRecord(atomic_start), "cudaEventRecord atomic_groupby_start");
         {
             NvtxRange kernel_range("atomic_groupby_sum_kernel_launch");
             filter_groupby_atomic_naive_kernel<<<blocks, threads>>>(
@@ -630,11 +684,9 @@ GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int i
                 static_cast<std::uint32_t>(num_groups));
             cuda_check(cudaGetLastError(), "filter_groupby_atomic_naive_kernel launch");
         }
-        cuda_check(cudaEventRecord(e2), "cudaEventRecord groupby_end");
-        cuda_check(cudaEventSynchronize(e2), "cudaEventSynchronize groupby_end");
-        acc_groupby += elapsed_ms(e1, e2, "cudaEventElapsedTime groupby");
+        cuda_check(cudaEventRecord(atomic_stop), "cudaEventRecord atomic_groupby_stop");
 
-        cuda_check(cudaEventRecord(e1), "cudaEventRecord d2h_start");
+        cuda_check(cudaEventRecord(d2h_start), "cudaEventRecord d2h_start");
         {
             NvtxRange d2h_range("d2h_transfer");
             cuda_check(cudaMemcpy(last.sum.data(), d_group_sum, static_cast<std::size_t>(num_groups) * sizeof(double),
@@ -648,16 +700,30 @@ GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int i
                                   cudaMemcpyDeviceToHost),
                        "cudaMemcpy D2H predicate_match_count");
         }
-        cuda_check(cudaEventRecord(e2), "cudaEventRecord d2h_end");
-        cuda_check(cudaEventSynchronize(e2), "cudaEventSynchronize d2h_end");
-        acc_d2h += elapsed_ms(e1, e2, "cudaEventElapsedTime d2h");
+        cuda_check(cudaEventRecord(d2h_stop), "cudaEventRecord d2h_stop");
 
-        cuda_check(cudaEventRecord(e3), "cudaEventRecord total_end");
-        cuda_check(cudaEventSynchronize(e3), "cudaEventSynchronize total_end");
-        acc_total += elapsed_ms(e0, e3, "cudaEventElapsedTime total");
+        cuda_check(cudaEventRecord(total_stop), "cudaEventRecord total_stop");
+
+        PipelineTiming iter_timing{};
+        record_pipeline_timing_atomic(total_start, total_stop, h2d_start, h2d_stop, atomic_start, atomic_stop, d2h_start,
+                                      d2h_stop, iter_timing);
+        acc_h2d += iter_timing.h2d_ms;
+        acc_groupby += iter_timing.atomic_groupby_kernel_ms;
+        acc_d2h += iter_timing.d2h_ms;
+        acc_total += iter_timing.total_gpu_ms;
+        if (measured_timing != nullptr) {
+            measured_timing->add(iter_timing);
+        }
     }
 
-    events_destroy(e0, e1, e2, e3);
+    event_destroy(total_start);
+    event_destroy(total_stop);
+    event_destroy(h2d_start);
+    event_destroy(h2d_stop);
+    event_destroy(atomic_start);
+    event_destroy(atomic_stop);
+    event_destroy(d2h_start);
+    event_destroy(d2h_stop);
     {
         NvtxRange free_range("cuda_free");
         cudaFree(d_trip);
@@ -699,7 +765,7 @@ GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int i
 
 GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns, int iterations, FilterGpuMetrics& metrics,
                                                          std::size_t num_groups, int threads_per_block,
-                                                         const char* nvtx_iteration_prefix) {
+                                                         const char* nvtx_iteration_prefix, TimingStats* measured_timing) {
     if (iterations < 1) {
         throw std::runtime_error("iterations must be >= 1");
     }
@@ -767,8 +833,34 @@ GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns,
                                         static_cast<std::size_t>(threads));
     const int reduce_blocks = compute_blocks(n, threads);
 
-    cudaEvent_t e0{}, e1{}, e2{}, e3{};
-    events_create(e0, e1, e2, e3);
+    cudaEvent_t total_start{};
+    cudaEvent_t total_stop{};
+    cudaEvent_t h2d_start{};
+    cudaEvent_t h2d_stop{};
+    cudaEvent_t filter_start{};
+    cudaEvent_t filter_stop{};
+    cudaEvent_t scan_start{};
+    cudaEvent_t scan_stop{};
+    cudaEvent_t scatter_start{};
+    cudaEvent_t scatter_stop{};
+    cudaEvent_t reduce_start{};
+    cudaEvent_t reduce_stop{};
+    cudaEvent_t d2h_start{};
+    cudaEvent_t d2h_stop{};
+    event_create(total_start);
+    event_create(total_stop);
+    event_create(h2d_start);
+    event_create(h2d_stop);
+    event_create(filter_start);
+    event_create(filter_stop);
+    event_create(scan_start);
+    event_create(scan_stop);
+    event_create(scatter_start);
+    event_create(scatter_stop);
+    event_create(reduce_start);
+    event_create(reduce_stop);
+    event_create(d2h_start);
+    event_create(d2h_stop);
 
     double acc_h2d = 0.0;
     double acc_filter = 0.0;
@@ -791,9 +883,9 @@ GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns,
                               static_cast<std::size_t>(num_groups) * sizeof(unsigned long long)),
                     "cudaMemset d_group_count");
 
-        cuda_check(cudaEventRecord(e0), "cudaEventRecord total_start");
+        cuda_check(cudaEventRecord(total_start), "cudaEventRecord total_start");
 
-        cuda_check(cudaEventRecord(e1), "cudaEventRecord h2d_start");
+        cuda_check(cudaEventRecord(h2d_start), "cudaEventRecord h2d_start");
         {
             NvtxRange h2d_range("h2d_transfer");
             cuda_check(cudaMemcpy(d_trip, columns.trip_distance.data(), bytes_float_col, cudaMemcpyHostToDevice),
@@ -803,39 +895,31 @@ GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns,
             cuda_check(cudaMemcpy(d_pc, columns.passenger_count.data(), bytes_pc, cudaMemcpyHostToDevice),
                         "cudaMemcpy H2D passenger_count");
         }
-        cuda_check(cudaEventRecord(e2), "cudaEventRecord h2d_end");
-        cuda_check(cudaEventSynchronize(e2), "cudaEventSynchronize h2d_end");
-        acc_h2d += elapsed_ms(e1, e2, "cudaEventElapsedTime h2d");
+        cuda_check(cudaEventRecord(h2d_stop), "cudaEventRecord h2d_stop");
 
-        cuda_check(cudaEventRecord(e1), "cudaEventRecord filter_start");
+        cuda_check(cudaEventRecord(filter_start), "cudaEventRecord filter_start");
         {
             NvtxRange filter_range("filter_kernel_launch");
             filter_mask_kernel<<<blocks, threads>>>(d_trip, d_fare, n, d_mask);
             cuda_check(cudaGetLastError(), "filter_mask_kernel launch");
         }
-        cuda_check(cudaEventRecord(e2), "cudaEventRecord filter_end");
-        cuda_check(cudaEventSynchronize(e2), "cudaEventSynchronize filter_end");
-        acc_filter += elapsed_ms(e1, e2, "cudaEventElapsedTime filter");
+        cuda_check(cudaEventRecord(filter_stop), "cudaEventRecord filter_stop");
 
-        cuda_check(cudaEventRecord(e1), "cudaEventRecord scan_start");
+        cuda_check(cudaEventRecord(scan_start), "cudaEventRecord scan_start");
         mask_u8_to_u64_kernel<<<blocks, threads>>>(d_mask, d_mask_u64, n);
         cuda_check(cudaGetLastError(), "mask_u8_to_u64_kernel launch");
         thrust::exclusive_scan(thrust::device, d_mask_u64, d_mask_u64 + n, d_offsets);
         cuda_check(cudaGetLastError(), "thrust::exclusive_scan");
-        cuda_check(cudaEventRecord(e2), "cudaEventRecord scan_end");
-        cuda_check(cudaEventSynchronize(e2), "cudaEventSynchronize scan_end");
-        acc_scan += elapsed_ms(e1, e2, "cudaEventElapsedTime scan");
+        cuda_check(cudaEventRecord(scan_stop), "cudaEventRecord scan_stop");
 
-        cuda_check(cudaEventRecord(e1), "cudaEventRecord scatter_start");
+        cuda_check(cudaEventRecord(scatter_start), "cudaEventRecord scatter_start");
         scatter_selected_indices_kernel<<<blocks, threads>>>(d_mask_u64, d_offsets, n, d_selected_indices);
         cuda_check(cudaGetLastError(), "scatter_selected_indices_kernel launch");
         write_selected_count_kernel<<<1, 1>>>(d_mask_u64, d_offsets, n, d_selected_count);
         cuda_check(cudaGetLastError(), "write_selected_count_kernel launch");
-        cuda_check(cudaEventRecord(e2), "cudaEventRecord scatter_end");
-        cuda_check(cudaEventSynchronize(e2), "cudaEventSynchronize scatter_end");
-        acc_scatter += elapsed_ms(e1, e2, "cudaEventElapsedTime scatter");
+        cuda_check(cudaEventRecord(scatter_stop), "cudaEventRecord scatter_stop");
 
-        cuda_check(cudaEventRecord(e1), "cudaEventRecord groupby_start");
+        cuda_check(cudaEventRecord(reduce_start), "cudaEventRecord block_partial_reduce_start");
         {
             NvtxRange reduce_range("block_partial_reduce_kernel_launch");
             const std::size_t shmem_bytes =
@@ -845,11 +929,9 @@ GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns,
                 static_cast<std::uint32_t>(num_groups));
             cuda_check(cudaGetLastError(), "groupby_selected_block_partial_kernel launch");
         }
-        cuda_check(cudaEventRecord(e2), "cudaEventRecord groupby_end");
-        cuda_check(cudaEventSynchronize(e2), "cudaEventSynchronize groupby_end");
-        acc_groupby += elapsed_ms(e1, e2, "cudaEventElapsedTime groupby");
+        cuda_check(cudaEventRecord(reduce_stop), "cudaEventRecord block_partial_reduce_stop");
 
-        cuda_check(cudaEventRecord(e1), "cudaEventRecord d2h_start");
+        cuda_check(cudaEventRecord(d2h_start), "cudaEventRecord d2h_start");
         {
             NvtxRange d2h_range("d2h_transfer");
             cuda_check(cudaMemcpy(&last_selected, d_selected_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost),
@@ -862,16 +944,40 @@ GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns,
                                   cudaMemcpyDeviceToHost),
                        "cudaMemcpy D2H group_count");
         }
-        cuda_check(cudaEventRecord(e2), "cudaEventRecord d2h_end");
-        cuda_check(cudaEventSynchronize(e2), "cudaEventSynchronize d2h_end");
-        acc_d2h += elapsed_ms(e1, e2, "cudaEventElapsedTime d2h");
+        cuda_check(cudaEventRecord(d2h_stop), "cudaEventRecord d2h_stop");
 
-        cuda_check(cudaEventRecord(e3), "cudaEventRecord total_end");
-        cuda_check(cudaEventSynchronize(e3), "cudaEventSynchronize total_end");
-        acc_total += elapsed_ms(e0, e3, "cudaEventElapsedTime total");
+        cuda_check(cudaEventRecord(total_stop), "cudaEventRecord total_stop");
+
+        PipelineTiming iter_timing{};
+        record_pipeline_timing_block_partial(total_start, total_stop, h2d_start, h2d_stop, filter_start, filter_stop,
+                                             scan_start, scan_stop, scatter_start, scatter_stop, reduce_start,
+                                             reduce_stop, d2h_start, d2h_stop, iter_timing);
+        acc_h2d += iter_timing.h2d_ms;
+        acc_filter += iter_timing.filter_kernel_ms;
+        acc_scan += iter_timing.scan_kernel_ms;
+        acc_scatter += iter_timing.scatter_kernel_ms;
+        acc_groupby += iter_timing.block_partial_reduce_kernel_ms;
+        acc_d2h += iter_timing.d2h_ms;
+        acc_total += iter_timing.total_gpu_ms;
+        if (measured_timing != nullptr) {
+            measured_timing->add(iter_timing);
+        }
     }
 
-    events_destroy(e0, e1, e2, e3);
+    event_destroy(total_start);
+    event_destroy(total_stop);
+    event_destroy(h2d_start);
+    event_destroy(h2d_stop);
+    event_destroy(filter_start);
+    event_destroy(filter_stop);
+    event_destroy(scan_start);
+    event_destroy(scan_stop);
+    event_destroy(scatter_start);
+    event_destroy(scatter_stop);
+    event_destroy(reduce_start);
+    event_destroy(reduce_stop);
+    event_destroy(d2h_start);
+    event_destroy(d2h_stop);
     {
         NvtxRange free_range("cuda_free");
         cudaFree(d_trip);

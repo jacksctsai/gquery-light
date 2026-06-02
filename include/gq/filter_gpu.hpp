@@ -1,5 +1,6 @@
 #pragma once
 
+#include "gq/pipeline_timing.hpp"
 #include "gq/types.hpp"
 #include <cstdint>
 
@@ -63,13 +64,15 @@ Result filter_and_sum_gpu_compact_block_partial(const Columns& columns, int iter
  */
 GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int iterations, FilterGpuMetrics& metrics,
                                                   std::size_t num_groups, int threads_per_block = 256,
-                                                  const char* nvtx_iteration_prefix = nullptr);
+                                                  const char* nvtx_iteration_prefix = nullptr,
+                                                  TimingStats* measured_timing = nullptr);
 
 /**
  * Filter + compact + block-local partial GROUP BY with a final global merge (atomics on key slots).
  */
 GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns, int iterations, FilterGpuMetrics& metrics,
                                                          std::size_t num_groups, int threads_per_block = 256,
-                                                         const char* nvtx_iteration_prefix = nullptr);
+                                                         const char* nvtx_iteration_prefix = nullptr,
+                                                         TimingStats* measured_timing = nullptr);
 
 } // namespace gq
