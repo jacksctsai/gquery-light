@@ -1,0 +1,15 @@
+
+NOTICE: Existing SQLite export found: /tmp/baseline_debug.sqlite
+        It is assumed file was previously exported from: /tmp/baseline_debug.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [/tmp/baseline_debug.sqlite] with [/usr/local/cuda-12.8/nsight-systems-2024.6.2/host-linux-x64/reports/cuda_gpu_mem_time_sum.py]... 
+
+ ** CUDA GPU MemOps Summary (by Time) (cuda_gpu_mem_time_sum):
+
+ Time (%)  Total Time (ns)  Count  Avg (ns)   Med (ns)   Min (ns)  Max (ns)  StdDev (ns)           Operation          
+ --------  ---------------  -----  ---------  ---------  --------  --------  -----------  ----------------------------
+     99.9         40964772      9  4551641.3  3884127.0   3879327   7057860    1329409.0  [CUDA memcpy Host-to-Device]
+      0.1            23584      9     2620.4     3328.0       704      3424       1154.7  [CUDA memset]               
+      0.1            22144      9     2460.4     2496.0      2048      2528        155.5  [CUDA memcpy Device-to-Host]
+

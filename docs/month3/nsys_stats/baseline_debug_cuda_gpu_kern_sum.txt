@@ -1,0 +1,19 @@
+
+NOTICE: Existing SQLite export found: /tmp/baseline_debug.sqlite
+        It is assumed file was previously exported from: /tmp/baseline_debug.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [/tmp/baseline_debug.sqlite] with [/usr/local/cuda-12.8/nsight-systems-2024.6.2/host-linux-x64/reports/cuda_gpu_kern_sum.py]... 
+
+ ** CUDA GPU Kernel Summary (cuda_gpu_kern_sum):
+
+ Time (%)  Total Time (ns)  Instances   Avg (ns)    Med (ns)   Min (ns)  Max (ns)  StdDev (ns)                                                  Name                                                
+ --------  ---------------  ---------  ----------  ----------  --------  --------  -----------  ----------------------------------------------------------------------------------------------------
+     85.3         45960634          3  15320211.3  15305790.0  15254367  15400477      74114.9  gq::<unnamed>::groupby_selected_block_partial_kernel(const float *, const unsigned int *, const uns…
+      4.6          2470571          3    823523.7    822969.0    822841    824761       1073.5  gq::<unnamed>::scatter_selected_indices_kernel(const unsigned long *, const unsigned long *, unsign…
+      4.5          2437836          3    812612.0    813081.0    811450    813305       1012.5  void cub::CUB_200700_750_NS::DeviceScanKernel<cub::CUB_200700_750_NS::DeviceScanPolicy<unsigned lon…
+      2.9          1576499          3    525499.7    524476.0    524379    527644       1857.7  gq::<unnamed>::mask_u8_to_u64_kernel(const unsigned char *, unsigned long *, unsigned long)         
+      2.7          1439507          3    479835.7    479964.0    478780    480763        997.7  gq::<unnamed>::filter_mask_kernel(const float *, const float *, unsigned long, unsigned char *)     
+      0.0            10464          3      3488.0      3520.0      3424      3520         55.4  gq::<unnamed>::write_selected_count_kernel(const unsigned long *, const unsigned long *, unsigned l…
+      0.0            10239          3      3413.0      3487.0      3264      3488        129.0  void cub::CUB_200700_750_NS::DeviceScanInitKernel<cub::CUB_200700_750_NS::ScanTileState<unsigned lo…
+

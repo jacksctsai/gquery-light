@@ -1,0 +1,25 @@
+
+NOTICE: Existing SQLite export found: /tmp/baseline_debug.sqlite
+        It is assumed file was previously exported from: /tmp/baseline_debug.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [/tmp/baseline_debug.sqlite] with [/usr/local/cuda-12.8/nsight-systems-2024.6.2/host-linux-x64/reports/cuda_api_sum.py]... 
+
+ ** CUDA API Summary (cuda_api_sum):
+
+ Time (%)  Total Time (ns)  Num Calls   Avg (ns)     Med (ns)   Min (ns)  Max (ns)   StdDev (ns)           Name         
+ --------  ---------------  ---------  -----------  ----------  --------  ---------  -----------  ----------------------
+     72.1        378742327          3  126247442.3  26298105.0  26128787  326315435  173263984.8  cudaMallocHost        
+     17.6         92284737         18    5126929.8   3896485.5     14290   16215324    5662829.3  cudaMemcpy            
+      5.1         26905189          3    8968396.3   8847806.0   8405745    9651638     631639.8  cudaFreeHost          
+      2.9         15300600         23     665243.5   1018854.0      2684    1153198     510778.2  cudaFree              
+      1.0          5286734          3    1762244.7   1778329.0   1711186    1797219      45215.6  cudaStreamSynchronize 
+      0.5          2369678         23     103029.5     96288.0      2282     459090     112831.0  cudaMalloc            
+      0.3          1791041         21      85287.7      6016.0      4126    1574533     341363.8  cudaLaunchKernel      
+      0.2          1146756          9     127417.3      8865.0      4395    1060245     349927.3  cudaMemset            
+      0.2          1037316         42      24698.0      3033.0      2203     885942     136143.1  cudaEventRecord       
+      0.0            60706         28       2168.1       436.5       417      34972       6517.5  cudaEventCreate       
+      0.0            18395          3       6131.7      6080.0      5838       6477        322.6  cudaEventSynchronize  
+      0.0            11173         28        399.0       322.0       289       1369        230.9  cudaEventDestroy      
+      0.0             1231          1       1231.0      1231.0      1231       1231          0.0  cuModuleGetLoadingMode
+
