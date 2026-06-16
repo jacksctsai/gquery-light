@@ -3,7 +3,10 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <new>
+#include <stdexcept>
+#include <utility>
 #include <vector>
 
 #ifdef GQUERY_USE_CUDA
@@ -19,52 +22,165 @@ struct Row {
     float fare_amount{};
 };
 
-#ifdef GQUERY_USE_CUDA
-template <class T>
-class CudaPinnedAllocator {
-public:
-    using value_type = T;
-
-    CudaPinnedAllocator() noexcept = default;
-    template <class U>
-    CudaPinnedAllocator(const CudaPinnedAllocator<U>&) noexcept {}
-
-    [[nodiscard]] T* allocate(std::size_t n) {
-        if (n == 0) {
-            return nullptr;
-        }
-        void* p = nullptr;
-        const cudaError_t err = cudaMallocHost(&p, n * sizeof(T));
-        if (err != cudaSuccess || p == nullptr) {
-            throw std::bad_alloc();
-        }
-        return static_cast<T*>(p);
-    }
-
-    void deallocate(T* p, std::size_t) noexcept {
-        if (p) {
-            cudaFreeHost(p);
-        }
-    }
+enum class HostMemoryMode {
+    Pageable,
+    Pinned
 };
 
-template <class T, class U>
-inline bool operator==(const CudaPinnedAllocator<T>&, const CudaPinnedAllocator<U>&) noexcept {
-    return true;
-}
-template <class T, class U>
-inline bool operator!=(const CudaPinnedAllocator<T>&, const CudaPinnedAllocator<U>&) noexcept {
-    return false;
-}
+enum class ExecutionMode {
+    Sync,
+    SingleStreamAsync
+};
 
-using HostFloatVector = std::vector<float, CudaPinnedAllocator<float>>;
-using HostUint8Vector = std::vector<std::uint8_t, CudaPinnedAllocator<std::uint8_t>>;
-using HostUint32Vector = std::vector<std::uint32_t, CudaPinnedAllocator<std::uint32_t>>;
-#else
-using HostFloatVector = std::vector<float>;
-using HostUint8Vector = std::vector<std::uint8_t>;
-using HostUint32Vector = std::vector<std::uint32_t>;
+#ifdef GQUERY_USE_CUDA
+inline void cuda_host_check(cudaError_t err, const char* what) {
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(err));
+    }
+}
 #endif
+
+template <class T>
+class HostVector {
+public:
+    HostVector() noexcept = default;
+
+    HostVector(std::initializer_list<T> init) {
+        assign(init);
+    }
+
+    HostVector(const HostVector&) = delete;
+    HostVector& operator=(const HostVector&) = delete;
+
+    HostVector(HostVector&& other) noexcept
+        : data_(other.data_), size_(other.size_), pinned_(other.pinned_) {
+        other.data_ = nullptr;
+        other.size_ = 0;
+        other.pinned_ = false;
+    }
+
+    HostVector& operator=(HostVector&& other) noexcept {
+        if (this != &other) {
+            release();
+            data_ = other.data_;
+            size_ = other.size_;
+            pinned_ = other.pinned_;
+            other.data_ = nullptr;
+            other.size_ = 0;
+            other.pinned_ = false;
+        }
+        return *this;
+    }
+
+    HostVector& operator=(std::initializer_list<T> init) {
+        assign(init);
+        return *this;
+    }
+
+    ~HostVector() {
+        release();
+    }
+
+    void resize(std::size_t n, bool pinned = false) {
+        if (n == size_ && pinned == pinned_) {
+            return;
+        }
+        release();
+        size_ = n;
+        pinned_ = pinned;
+        if (n == 0) {
+            return;
+        }
+#ifdef GQUERY_USE_CUDA
+        if (pinned_) {
+            cuda_host_check(cudaMallocHost(reinterpret_cast<void**>(&data_), n * sizeof(T)), "cudaMallocHost");
+        } else {
+            data_ = new T[n];
+        }
+#else
+        if (pinned_) {
+            throw std::runtime_error("pinned host memory requires CUDA build");
+        }
+        data_ = new T[n];
+#endif
+    }
+
+    [[nodiscard]] T& operator[](std::size_t i) {
+        return data_[i];
+    }
+    [[nodiscard]] const T& operator[](std::size_t i) const {
+        return data_[i];
+    }
+
+    [[nodiscard]] T* data() noexcept {
+        return data_;
+    }
+    [[nodiscard]] const T* data() const noexcept {
+        return data_;
+    }
+
+    [[nodiscard]] std::size_t size() const noexcept {
+        return size_;
+    }
+
+    [[nodiscard]] bool empty() const noexcept {
+        return size_ == 0;
+    }
+
+    [[nodiscard]] bool is_pinned() const noexcept {
+        return pinned_;
+    }
+
+    [[nodiscard]] T* begin() noexcept {
+        return data_;
+    }
+    [[nodiscard]] const T* begin() const noexcept {
+        return data_;
+    }
+    [[nodiscard]] T* end() noexcept {
+        return data_ + size_;
+    }
+    [[nodiscard]] const T* end() const noexcept {
+        return data_ + size_;
+    }
+
+private:
+    void assign(std::initializer_list<T> init) {
+        resize(init.size(), false);
+        std::size_t i = 0;
+        for (const T& v : init) {
+            data_[i++] = v;
+        }
+    }
+
+    void release() noexcept {
+        if (data_ == nullptr) {
+            size_ = 0;
+            pinned_ = false;
+            return;
+        }
+#ifdef GQUERY_USE_CUDA
+        if (pinned_) {
+            cudaFreeHost(data_);
+        } else {
+            delete[] data_;
+        }
+#else
+        delete[] data_;
+#endif
+        data_ = nullptr;
+        size_ = 0;
+        pinned_ = false;
+    }
+
+    T* data_ = nullptr;
+    std::size_t size_ = 0;
+    bool pinned_ = false;
+};
+
+using HostFloatVector = HostVector<float>;
+using HostUint8Vector = HostVector<std::uint8_t>;
+using HostUint32Vector = HostVector<std::uint32_t>;
 
 struct Columns {
     HostUint32Vector passenger_count;

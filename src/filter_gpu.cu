@@ -3,8 +3,10 @@
 #include "nvtx_utils.h"
 
 #include <cuda_runtime.h>
+#include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
 #include <thrust/scan.h>
+#include <thrust/system/cuda/execution_policy.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -50,10 +52,18 @@ inline void event_destroy(cudaEvent_t e) {
     cudaEventDestroy(e);
 }
 
+inline void synchronize_pipeline(cudaStream_t stream, cudaEvent_t total_stop) {
+    if (stream != nullptr) {
+        cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+    }
+    cuda_check(cudaEventSynchronize(total_stop), "cudaEventSynchronize total_stop");
+}
+
 inline void record_pipeline_timing_atomic(cudaEvent_t total_start, cudaEvent_t total_stop, cudaEvent_t h2d_start,
                                           cudaEvent_t h2d_stop, cudaEvent_t atomic_start, cudaEvent_t atomic_stop,
-                                          cudaEvent_t d2h_start, cudaEvent_t d2h_stop, PipelineTiming& timing) {
-    cuda_check(cudaEventSynchronize(total_stop), "cudaEventSynchronize total_stop");
+                                          cudaEvent_t d2h_start, cudaEvent_t d2h_stop, PipelineTiming& timing,
+                                          cudaStream_t stream) {
+    synchronize_pipeline(stream, total_stop);
     timing.total_gpu_ms = elapsed_ms(total_start, total_stop, "cudaEventElapsedTime total");
     timing.h2d_ms = elapsed_ms(h2d_start, h2d_stop, "cudaEventElapsedTime h2d");
     timing.filter_kernel_ms = 0.0;
@@ -69,8 +79,9 @@ inline void record_pipeline_timing_block_partial(cudaEvent_t total_start, cudaEv
                                                  cudaEvent_t h2d_stop, cudaEvent_t filter_start, cudaEvent_t filter_stop,
                                                  cudaEvent_t scan_start, cudaEvent_t scan_stop, cudaEvent_t scatter_start,
                                                  cudaEvent_t scatter_stop, cudaEvent_t reduce_start, cudaEvent_t reduce_stop,
-                                                 cudaEvent_t d2h_start, cudaEvent_t d2h_stop, PipelineTiming& timing) {
-    cuda_check(cudaEventSynchronize(total_stop), "cudaEventSynchronize total_stop");
+                                                 cudaEvent_t d2h_start, cudaEvent_t d2h_stop, PipelineTiming& timing,
+                                                 cudaStream_t stream) {
+    synchronize_pipeline(stream, total_stop);
     timing.total_gpu_ms = elapsed_ms(total_start, total_stop, "cudaEventElapsedTime total");
     timing.h2d_ms = elapsed_ms(h2d_start, h2d_stop, "cudaEventElapsedTime h2d");
     timing.filter_kernel_ms = elapsed_ms(filter_start, filter_stop, "cudaEventElapsedTime filter");
@@ -95,6 +106,68 @@ inline int compute_blocks(std::size_t items, int threads_per_block, int max_bloc
         (items + static_cast<std::size_t>(threads_per_block) - 1U) / static_cast<std::size_t>(threads_per_block);
     const std::size_t clamped = std::min<std::size_t>(raw, static_cast<std::size_t>(max_blocks));
     return static_cast<int>(clamped > 0 ? clamped : 1U);
+}
+
+class CudaStreamGuard {
+public:
+    explicit CudaStreamGuard(ExecutionMode execution) : async_(execution == ExecutionMode::SingleStreamAsync) {
+        if (async_) {
+            cuda_check(cudaStreamCreate(&stream_), "cudaStreamCreate");
+        }
+    }
+
+    ~CudaStreamGuard() {
+        if (async_) {
+            cudaStreamDestroy(stream_);
+        }
+    }
+
+    CudaStreamGuard(const CudaStreamGuard&) = delete;
+    CudaStreamGuard& operator=(const CudaStreamGuard&) = delete;
+
+    [[nodiscard]] bool async() const noexcept {
+        return async_;
+    }
+
+    [[nodiscard]] cudaStream_t stream() const noexcept {
+        return async_ ? stream_ : nullptr;
+    }
+
+private:
+    bool async_{false};
+    cudaStream_t stream_{};
+};
+
+inline void event_record(cudaEvent_t event, cudaStream_t stream) {
+    if (stream != nullptr) {
+        cuda_check(cudaEventRecord(event, stream), "cudaEventRecord");
+    } else {
+        cuda_check(cudaEventRecord(event), "cudaEventRecord");
+    }
+}
+
+inline void memcpy_h2d(void* dst, const void* src, std::size_t bytes, cudaStream_t stream) {
+    if (stream != nullptr) {
+        cuda_check(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream), "cudaMemcpyAsync H2D");
+    } else {
+        cuda_check(cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice), "cudaMemcpy H2D");
+    }
+}
+
+inline void memcpy_d2h(void* dst, const void* src, std::size_t bytes, cudaStream_t stream) {
+    if (stream != nullptr) {
+        cuda_check(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream), "cudaMemcpyAsync D2H");
+    } else {
+        cuda_check(cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost), "cudaMemcpy D2H");
+    }
+}
+
+inline void memset_device(void* dst, int value, std::size_t bytes, cudaStream_t stream) {
+    if (stream != nullptr) {
+        cuda_check(cudaMemsetAsync(dst, value, bytes, stream), "cudaMemsetAsync");
+    } else {
+        cuda_check(cudaMemset(dst, value, bytes), "cudaMemset");
+    }
 }
 
 __global__ void filter_groupby_atomic_naive_kernel(const float* trip_distance, const float* fare_amount,
@@ -570,7 +643,8 @@ Result filter_and_sum_gpu_compact_block_partial(const Columns& columns, int iter
 
 GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int iterations, FilterGpuMetrics& metrics,
                                                    std::size_t num_groups, int threads_per_block,
-                                                   const char* nvtx_iteration_prefix, TimingStats* measured_timing) {
+                                                   const char* nvtx_iteration_prefix, TimingStats* measured_timing,
+                                                   ExecutionMode execution) {
     if (iterations < 1) {
         throw std::runtime_error("iterations must be >= 1");
     }
@@ -652,61 +726,61 @@ GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int i
     std::uint64_t selected_for_selectivity = 0;
     const char* iter_prefix = nvtx_iter_prefix_or_default(nvtx_iteration_prefix);
 
+    CudaStreamGuard stream_guard(execution);
+    const cudaStream_t stream = stream_guard.stream();
+    if (stream_guard.async()) {
+        NvtxRange execution_range("execution_single_stream_async");
+        // This path is async-capable but intentionally serialized.
+        // Because H2D, kernels, and D2H are issued into the same stream,
+        // they preserve order and are not expected to overlap.
+        // Multi-stream batching will be introduced in a later step.
+    } else {
+        NvtxRange execution_range("execution_sync");
+    }
+
     for (int it = 0; it < iterations; ++it) {
         NvtxRange iteration_range(iter_prefix, it);
 
-        cuda_check(cudaMemset(d_group_sum, 0, static_cast<std::size_t>(num_groups) * sizeof(double)),
-                    "cudaMemset d_group_sum");
-        cuda_check(cudaMemset(d_group_count, 0,
-                              static_cast<std::size_t>(num_groups) * sizeof(unsigned long long)),
-                    "cudaMemset d_group_count");
-        cuda_check(cudaMemset(d_pred_match, 0, sizeof(unsigned long long)), "cudaMemset d_pred_match");
+        memset_device(d_group_sum, 0, static_cast<std::size_t>(num_groups) * sizeof(double), stream);
+        memset_device(d_group_count, 0, static_cast<std::size_t>(num_groups) * sizeof(unsigned long long), stream);
+        memset_device(d_pred_match, 0, sizeof(unsigned long long), stream);
 
-        cuda_check(cudaEventRecord(total_start), "cudaEventRecord total_start");
+        event_record(total_start, stream);
 
-        cuda_check(cudaEventRecord(h2d_start), "cudaEventRecord h2d_start");
+        event_record(h2d_start, stream);
         {
             NvtxRange h2d_range("h2d_transfer");
-            cuda_check(cudaMemcpy(d_trip, columns.trip_distance.data(), bytes_float_col, cudaMemcpyHostToDevice),
-                        "cudaMemcpy H2D trip_distance");
-            cuda_check(cudaMemcpy(d_fare, columns.fare_amount.data(), bytes_float_col, cudaMemcpyHostToDevice),
-                        "cudaMemcpy H2D fare_amount");
-            cuda_check(cudaMemcpy(d_pc, columns.passenger_count.data(), bytes_pc, cudaMemcpyHostToDevice),
-                        "cudaMemcpy H2D passenger_count");
+            memcpy_h2d(d_trip, columns.trip_distance.data(), bytes_float_col, stream);
+            memcpy_h2d(d_fare, columns.fare_amount.data(), bytes_float_col, stream);
+            memcpy_h2d(d_pc, columns.passenger_count.data(), bytes_pc, stream);
         }
-        cuda_check(cudaEventRecord(h2d_stop), "cudaEventRecord h2d_stop");
+        event_record(h2d_stop, stream);
 
-        cuda_check(cudaEventRecord(atomic_start), "cudaEventRecord atomic_groupby_start");
+        event_record(atomic_start, stream);
         {
             NvtxRange kernel_range("atomic_groupby_sum_kernel_launch");
-            filter_groupby_atomic_naive_kernel<<<blocks, threads>>>(
+            filter_groupby_atomic_naive_kernel<<<blocks, threads, 0, stream>>>(
                 d_trip, d_fare, d_pc, n, d_group_sum, d_group_count, d_pred_match,
                 static_cast<std::uint32_t>(num_groups));
             cuda_check(cudaGetLastError(), "filter_groupby_atomic_naive_kernel launch");
         }
-        cuda_check(cudaEventRecord(atomic_stop), "cudaEventRecord atomic_groupby_stop");
+        event_record(atomic_stop, stream);
 
-        cuda_check(cudaEventRecord(d2h_start), "cudaEventRecord d2h_start");
+        event_record(d2h_start, stream);
         {
             NvtxRange d2h_range("d2h_transfer");
-            cuda_check(cudaMemcpy(last.sum.data(), d_group_sum, static_cast<std::size_t>(num_groups) * sizeof(double),
-                                  cudaMemcpyDeviceToHost),
-                       "cudaMemcpy D2H group_sum");
-            cuda_check(cudaMemcpy(last.count.data(), d_group_count,
-                                  static_cast<std::size_t>(num_groups) * sizeof(unsigned long long),
-                                  cudaMemcpyDeviceToHost),
-                       "cudaMemcpy D2H group_count");
-            cuda_check(cudaMemcpy(&selected_for_selectivity, d_pred_match, sizeof(unsigned long long),
-                                  cudaMemcpyDeviceToHost),
-                       "cudaMemcpy D2H predicate_match_count");
+            memcpy_d2h(last.sum.data(), d_group_sum, static_cast<std::size_t>(num_groups) * sizeof(double), stream);
+            memcpy_d2h(last.count.data(), d_group_count,
+                       static_cast<std::size_t>(num_groups) * sizeof(unsigned long long), stream);
+            memcpy_d2h(&selected_for_selectivity, d_pred_match, sizeof(unsigned long long), stream);
         }
-        cuda_check(cudaEventRecord(d2h_stop), "cudaEventRecord d2h_stop");
+        event_record(d2h_stop, stream);
 
-        cuda_check(cudaEventRecord(total_stop), "cudaEventRecord total_stop");
+        event_record(total_stop, stream);
 
         PipelineTiming iter_timing{};
         record_pipeline_timing_atomic(total_start, total_stop, h2d_start, h2d_stop, atomic_start, atomic_stop, d2h_start,
-                                      d2h_stop, iter_timing);
+                                      d2h_stop, iter_timing, stream);
         acc_h2d += iter_timing.h2d_ms;
         acc_groupby += iter_timing.atomic_groupby_kernel_ms;
         acc_d2h += iter_timing.d2h_ms;
@@ -765,7 +839,8 @@ GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int i
 
 GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns, int iterations, FilterGpuMetrics& metrics,
                                                          std::size_t num_groups, int threads_per_block,
-                                                         const char* nvtx_iteration_prefix, TimingStats* measured_timing) {
+                                                         const char* nvtx_iteration_prefix, TimingStats* measured_timing,
+                                                         ExecutionMode execution) {
     if (iterations < 1) {
         throw std::runtime_error("iterations must be >= 1");
     }
@@ -873,85 +948,90 @@ GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns,
     unsigned long long last_selected = 0;
     const char* iter_prefix = nvtx_iter_prefix_or_default(nvtx_iteration_prefix);
 
+    CudaStreamGuard stream_guard(execution);
+    const cudaStream_t stream = stream_guard.stream();
+    if (stream_guard.async()) {
+        NvtxRange execution_range("execution_single_stream_async");
+        // This path is async-capable but intentionally serialized.
+        // Because H2D, kernels, and D2H are issued into the same stream,
+        // they preserve order and are not expected to overlap.
+        // Multi-stream batching will be introduced in a later step.
+    } else {
+        NvtxRange execution_range("execution_sync");
+    }
+
     for (int it = 0; it < iterations; ++it) {
         NvtxRange iteration_range(iter_prefix, it);
 
-        cuda_check(cudaMemset(d_selected_count, 0, sizeof(unsigned long long)), "cudaMemset d_selected_count");
-        cuda_check(cudaMemset(d_group_sum, 0, static_cast<std::size_t>(num_groups) * sizeof(double)),
-                    "cudaMemset d_group_sum");
-        cuda_check(cudaMemset(d_group_count, 0,
-                              static_cast<std::size_t>(num_groups) * sizeof(unsigned long long)),
-                    "cudaMemset d_group_count");
+        memset_device(d_selected_count, 0, sizeof(unsigned long long), stream);
+        memset_device(d_group_sum, 0, static_cast<std::size_t>(num_groups) * sizeof(double), stream);
+        memset_device(d_group_count, 0, static_cast<std::size_t>(num_groups) * sizeof(unsigned long long), stream);
 
-        cuda_check(cudaEventRecord(total_start), "cudaEventRecord total_start");
+        event_record(total_start, stream);
 
-        cuda_check(cudaEventRecord(h2d_start), "cudaEventRecord h2d_start");
+        event_record(h2d_start, stream);
         {
             NvtxRange h2d_range("h2d_transfer");
-            cuda_check(cudaMemcpy(d_trip, columns.trip_distance.data(), bytes_float_col, cudaMemcpyHostToDevice),
-                        "cudaMemcpy H2D trip_distance");
-            cuda_check(cudaMemcpy(d_fare, columns.fare_amount.data(), bytes_float_col, cudaMemcpyHostToDevice),
-                        "cudaMemcpy H2D fare_amount");
-            cuda_check(cudaMemcpy(d_pc, columns.passenger_count.data(), bytes_pc, cudaMemcpyHostToDevice),
-                        "cudaMemcpy H2D passenger_count");
+            memcpy_h2d(d_trip, columns.trip_distance.data(), bytes_float_col, stream);
+            memcpy_h2d(d_fare, columns.fare_amount.data(), bytes_float_col, stream);
+            memcpy_h2d(d_pc, columns.passenger_count.data(), bytes_pc, stream);
         }
-        cuda_check(cudaEventRecord(h2d_stop), "cudaEventRecord h2d_stop");
+        event_record(h2d_stop, stream);
 
-        cuda_check(cudaEventRecord(filter_start), "cudaEventRecord filter_start");
+        event_record(filter_start, stream);
         {
             NvtxRange filter_range("filter_kernel_launch");
-            filter_mask_kernel<<<blocks, threads>>>(d_trip, d_fare, n, d_mask);
+            filter_mask_kernel<<<blocks, threads, 0, stream>>>(d_trip, d_fare, n, d_mask);
             cuda_check(cudaGetLastError(), "filter_mask_kernel launch");
         }
-        cuda_check(cudaEventRecord(filter_stop), "cudaEventRecord filter_stop");
+        event_record(filter_stop, stream);
 
-        cuda_check(cudaEventRecord(scan_start), "cudaEventRecord scan_start");
-        mask_u8_to_u64_kernel<<<blocks, threads>>>(d_mask, d_mask_u64, n);
+        event_record(scan_start, stream);
+        mask_u8_to_u64_kernel<<<blocks, threads, 0, stream>>>(d_mask, d_mask_u64, n);
         cuda_check(cudaGetLastError(), "mask_u8_to_u64_kernel launch");
-        thrust::exclusive_scan(thrust::device, d_mask_u64, d_mask_u64 + n, d_offsets);
+        if (stream != nullptr) {
+            thrust::exclusive_scan(thrust::cuda::par.on(stream), d_mask_u64, d_mask_u64 + n, d_offsets);
+        } else {
+            thrust::exclusive_scan(thrust::device, d_mask_u64, d_mask_u64 + n, d_offsets);
+        }
         cuda_check(cudaGetLastError(), "thrust::exclusive_scan");
-        cuda_check(cudaEventRecord(scan_stop), "cudaEventRecord scan_stop");
+        event_record(scan_stop, stream);
 
-        cuda_check(cudaEventRecord(scatter_start), "cudaEventRecord scatter_start");
-        scatter_selected_indices_kernel<<<blocks, threads>>>(d_mask_u64, d_offsets, n, d_selected_indices);
+        event_record(scatter_start, stream);
+        scatter_selected_indices_kernel<<<blocks, threads, 0, stream>>>(d_mask_u64, d_offsets, n, d_selected_indices);
         cuda_check(cudaGetLastError(), "scatter_selected_indices_kernel launch");
-        write_selected_count_kernel<<<1, 1>>>(d_mask_u64, d_offsets, n, d_selected_count);
+        write_selected_count_kernel<<<1, 1, 0, stream>>>(d_mask_u64, d_offsets, n, d_selected_count);
         cuda_check(cudaGetLastError(), "write_selected_count_kernel launch");
-        cuda_check(cudaEventRecord(scatter_stop), "cudaEventRecord scatter_stop");
+        event_record(scatter_stop, stream);
 
-        cuda_check(cudaEventRecord(reduce_start), "cudaEventRecord block_partial_reduce_start");
+        event_record(reduce_start, stream);
         {
             NvtxRange reduce_range("block_partial_reduce_kernel_launch");
             const std::size_t shmem_bytes =
                 static_cast<std::size_t>(num_groups) * (sizeof(double) + sizeof(unsigned long long));
-            groupby_selected_block_partial_kernel<<<reduce_blocks, threads, shmem_bytes>>>(
+            groupby_selected_block_partial_kernel<<<reduce_blocks, threads, shmem_bytes, stream>>>(
                 d_fare, d_pc, d_selected_indices, d_selected_count, d_group_sum, d_group_count,
                 static_cast<std::uint32_t>(num_groups));
             cuda_check(cudaGetLastError(), "groupby_selected_block_partial_kernel launch");
         }
-        cuda_check(cudaEventRecord(reduce_stop), "cudaEventRecord block_partial_reduce_stop");
+        event_record(reduce_stop, stream);
 
-        cuda_check(cudaEventRecord(d2h_start), "cudaEventRecord d2h_start");
+        event_record(d2h_start, stream);
         {
             NvtxRange d2h_range("d2h_transfer");
-            cuda_check(cudaMemcpy(&last_selected, d_selected_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost),
-                        "cudaMemcpy D2H selected_count");
-            cuda_check(cudaMemcpy(last.sum.data(), d_group_sum, static_cast<std::size_t>(num_groups) * sizeof(double),
-                                  cudaMemcpyDeviceToHost),
-                       "cudaMemcpy D2H group_sum");
-            cuda_check(cudaMemcpy(last.count.data(), d_group_count,
-                                  static_cast<std::size_t>(num_groups) * sizeof(unsigned long long),
-                                  cudaMemcpyDeviceToHost),
-                       "cudaMemcpy D2H group_count");
+            memcpy_d2h(&last_selected, d_selected_count, sizeof(unsigned long long), stream);
+            memcpy_d2h(last.sum.data(), d_group_sum, static_cast<std::size_t>(num_groups) * sizeof(double), stream);
+            memcpy_d2h(last.count.data(), d_group_count,
+                       static_cast<std::size_t>(num_groups) * sizeof(unsigned long long), stream);
         }
-        cuda_check(cudaEventRecord(d2h_stop), "cudaEventRecord d2h_stop");
+        event_record(d2h_stop, stream);
 
-        cuda_check(cudaEventRecord(total_stop), "cudaEventRecord total_stop");
+        event_record(total_stop, stream);
 
         PipelineTiming iter_timing{};
         record_pipeline_timing_block_partial(total_start, total_stop, h2d_start, h2d_stop, filter_start, filter_stop,
                                              scan_start, scan_stop, scatter_start, scatter_stop, reduce_start,
-                                             reduce_stop, d2h_start, d2h_stop, iter_timing);
+                                             reduce_stop, d2h_start, d2h_stop, iter_timing, stream);
         acc_h2d += iter_timing.h2d_ms;
         acc_filter += iter_timing.filter_kernel_ms;
         acc_scan += iter_timing.scan_kernel_ms;

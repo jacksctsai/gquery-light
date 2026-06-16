@@ -355,6 +355,8 @@ struct BenchmarkConfig {
     int seed = 42;
     bool validate = true;
     int threads_per_block = 256;
+    gq::HostMemoryMode memory = gq::HostMemoryMode::Pageable;
+    gq::ExecutionMode execution = gq::ExecutionMode::Sync;
 };
 
 static const char* to_string(Distribution d) {
@@ -370,6 +372,22 @@ static const char* to_string(ReductionMode m) {
     switch (m) {
         case ReductionMode::Atomic: return "atomic";
         case ReductionMode::BlockPartial: return "block-partial";
+    }
+    return "unknown";
+}
+
+static const char* to_string(gq::HostMemoryMode m) {
+    switch (m) {
+        case gq::HostMemoryMode::Pageable: return "pageable";
+        case gq::HostMemoryMode::Pinned: return "pinned";
+    }
+    return "unknown";
+}
+
+static const char* to_string(gq::ExecutionMode e) {
+    switch (e) {
+        case gq::ExecutionMode::Sync: return "sync";
+        case gq::ExecutionMode::SingleStreamAsync: return "single-stream-async";
     }
     return "unknown";
 }
@@ -396,6 +414,8 @@ static void print_usage(const char* argv0) {
               << "  --seed N\n"
               << "  --validate true|false\n"
               << "  --threads-per-block N\n"
+              << "  --memory pageable|pinned\n"
+              << "  --execution sync|single-stream-async\n"
               << "  --help\n";
 }
 
@@ -444,6 +464,24 @@ static BenchmarkConfig parseArgs(int argc, char** argv) {
             cfg.validate = parse_bool(need_value("--validate"));
         } else if (arg == "--threads-per-block") {
             cfg.threads_per_block = std::stoi(need_value("--threads-per-block"));
+        } else if (arg == "--memory") {
+            const std::string v = need_value("--memory");
+            if (v == "pageable") {
+                cfg.memory = gq::HostMemoryMode::Pageable;
+            } else if (v == "pinned") {
+                cfg.memory = gq::HostMemoryMode::Pinned;
+            } else {
+                throw std::runtime_error("unknown --memory: " + v);
+            }
+        } else if (arg == "--execution") {
+            const std::string v = need_value("--execution");
+            if (v == "sync") {
+                cfg.execution = gq::ExecutionMode::Sync;
+            } else if (v == "single-stream-async") {
+                cfg.execution = gq::ExecutionMode::SingleStreamAsync;
+            } else {
+                throw std::runtime_error("unknown --execution: " + v);
+            }
         } else if (arg.rfind("--", 0) == 0) {
             throw std::runtime_error("unknown option: " + arg);
         }
@@ -468,13 +506,16 @@ static void printConfig(const BenchmarkConfig& cfg) {
     std::cout << "seed:         " << cfg.seed << "\n";
     std::cout << "validate:     " << (cfg.validate ? "true" : "false") << "\n";
     std::cout << "threads_per_block: " << cfg.threads_per_block << "\n";
+    std::cout << "memory:       " << to_string(cfg.memory) << "\n";
+    std::cout << "execution:    " << to_string(cfg.execution) << "\n";
 }
 
 static gq::Columns generateDataset(const BenchmarkConfig& cfg) {
     gq::Columns cols;
-    cols.passenger_count.resize(cfg.num_rows);
-    cols.trip_distance.resize(cfg.num_rows);
-    cols.fare_amount.resize(cfg.num_rows);
+    const bool pinned = cfg.memory == gq::HostMemoryMode::Pinned;
+    cols.passenger_count.resize(cfg.num_rows, pinned);
+    cols.trip_distance.resize(cfg.num_rows, pinned);
+    cols.fare_amount.resize(cfg.num_rows, pinned);
 
     std::mt19937 rng(static_cast<std::uint32_t>(cfg.seed));
     std::uniform_real_distribution<float> td_dist(0.0f, 6.0f);
@@ -515,10 +556,19 @@ int main(int argc, char** argv) {
                 NvtxRange program_range("program_total");
                 printConfig(cfg);
 
+                if (cfg.execution == gq::ExecutionMode::SingleStreamAsync &&
+                    cfg.memory == gq::HostMemoryMode::Pageable) {
+                    std::cerr
+                        << "Warning: single-stream-async with pageable memory may not provide true async host "
+                           "transfer behavior. Use --memory pinned for async transfer experiments.\n";
+                }
+
                 gq::Columns dataset;
                 double gen_ms = 0.0;
                 {
                     NvtxRange gen_range("cpu_generate_input");
+                    const NvtxRange memory_range(cfg.memory == gq::HostMemoryMode::Pinned ? "host_memory_pinned"
+                                                                                          : "host_memory_pageable");
                     gq::CpuTimer gen_timer;
                     dataset = generateDataset(cfg);
                     gen_ms = gen_timer.elapsed_ms();
@@ -532,11 +582,13 @@ int main(int argc, char** argv) {
                     if (cfg.mode == ReductionMode::Atomic) {
                         (void)gq::filter_groupby_gpu_atomic_baseline(dataset, cfg.warmup, warm_metrics,
                                                                      static_cast<std::size_t>(cfg.num_groups),
-                                                                     cfg.threads_per_block, "warmup_iteration");
+                                                                     cfg.threads_per_block, "warmup_iteration",
+                                                                     nullptr, cfg.execution);
                     } else {
                         (void)gq::filter_groupby_gpu_compact_block_partial(dataset, cfg.warmup, warm_metrics,
                                                                            static_cast<std::size_t>(cfg.num_groups),
-                                                                           cfg.threads_per_block, "warmup_iteration");
+                                                                           cfg.threads_per_block, "warmup_iteration",
+                                                                           nullptr, cfg.execution);
                     }
                 }
 
@@ -553,11 +605,11 @@ int main(int argc, char** argv) {
                         gpu_gb = gq::filter_groupby_gpu_atomic_baseline(dataset, cfg.iterations, gpu_metrics,
                                                                         static_cast<std::size_t>(cfg.num_groups),
                                                                         cfg.threads_per_block, "measured_iteration",
-                                                                        &timing_stats);
+                                                                        &timing_stats, cfg.execution);
                     } else {
                         gpu_gb = gq::filter_groupby_gpu_compact_block_partial(
                             dataset, cfg.iterations, gpu_metrics, static_cast<std::size_t>(cfg.num_groups),
-                            cfg.threads_per_block, "measured_iteration", &timing_stats);
+                            cfg.threads_per_block, "measured_iteration", &timing_stats, cfg.execution);
                     }
                 }
 
