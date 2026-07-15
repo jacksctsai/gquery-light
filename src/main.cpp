@@ -357,7 +357,15 @@ struct BenchmarkConfig {
     int threads_per_block = 256;
     gq::HostMemoryMode memory = gq::HostMemoryMode::Pageable;
     gq::ExecutionMode execution = gq::ExecutionMode::Sync;
+    std::size_t batch_rows = 0;
 };
+
+static std::size_t compute_num_batches(std::size_t num_rows, std::size_t batch_rows) {
+    if (batch_rows == 0 || batch_rows >= num_rows) {
+        return 1;
+    }
+    return (num_rows + batch_rows - 1) / batch_rows;
+}
 
 static const char* to_string(Distribution d) {
     switch (d) {
@@ -416,6 +424,7 @@ static void print_usage(const char* argv0) {
               << "  --threads-per-block N\n"
               << "  --memory pageable|pinned\n"
               << "  --execution sync|single-stream-async\n"
+              << "  --batch-rows N             Contiguous row-batch size (0 = all rows)\n"
               << "  --help\n";
 }
 
@@ -482,6 +491,16 @@ static BenchmarkConfig parseArgs(int argc, char** argv) {
             } else {
                 throw std::runtime_error("unknown --execution: " + v);
             }
+        } else if (arg == "--batch-rows") {
+            const std::string v = need_value("--batch-rows");
+            if (!v.empty() && v[0] == '-') {
+                throw std::runtime_error("--batch-rows must be >= 0");
+            }
+            const unsigned long long raw = std::stoull(v);
+            cfg.batch_rows = static_cast<std::size_t>(raw);
+            if (static_cast<unsigned long long>(cfg.batch_rows) != raw) {
+                throw std::runtime_error("--batch-rows value overflows size_t");
+            }
         } else if (arg.rfind("--", 0) == 0) {
             throw std::runtime_error("unknown option: " + arg);
         }
@@ -508,6 +527,8 @@ static void printConfig(const BenchmarkConfig& cfg) {
     std::cout << "threads_per_block: " << cfg.threads_per_block << "\n";
     std::cout << "memory:       " << to_string(cfg.memory) << "\n";
     std::cout << "execution:    " << to_string(cfg.execution) << "\n";
+    std::cout << "batch_rows:   " << cfg.batch_rows << "\n";
+    std::cout << "num_batches:  " << compute_num_batches(cfg.num_rows, cfg.batch_rows) << "\n";
 }
 
 static gq::Columns generateDataset(const BenchmarkConfig& cfg) {
@@ -583,12 +604,12 @@ int main(int argc, char** argv) {
                         (void)gq::filter_groupby_gpu_atomic_baseline(dataset, cfg.warmup, warm_metrics,
                                                                      static_cast<std::size_t>(cfg.num_groups),
                                                                      cfg.threads_per_block, "warmup_iteration",
-                                                                     nullptr, cfg.execution);
+                                                                     nullptr, cfg.execution, cfg.batch_rows);
                     } else {
                         (void)gq::filter_groupby_gpu_compact_block_partial(dataset, cfg.warmup, warm_metrics,
                                                                            static_cast<std::size_t>(cfg.num_groups),
                                                                            cfg.threads_per_block, "warmup_iteration",
-                                                                           nullptr, cfg.execution);
+                                                                           nullptr, cfg.execution, cfg.batch_rows);
                     }
                 }
 
@@ -605,11 +626,11 @@ int main(int argc, char** argv) {
                         gpu_gb = gq::filter_groupby_gpu_atomic_baseline(dataset, cfg.iterations, gpu_metrics,
                                                                         static_cast<std::size_t>(cfg.num_groups),
                                                                         cfg.threads_per_block, "measured_iteration",
-                                                                        &timing_stats, cfg.execution);
+                                                                        &timing_stats, cfg.execution, cfg.batch_rows);
                     } else {
                         gpu_gb = gq::filter_groupby_gpu_compact_block_partial(
                             dataset, cfg.iterations, gpu_metrics, static_cast<std::size_t>(cfg.num_groups),
-                            cfg.threads_per_block, "measured_iteration", &timing_stats, cfg.execution);
+                            cfg.threads_per_block, "measured_iteration", &timing_stats, cfg.execution, cfg.batch_rows);
                     }
                 }
 

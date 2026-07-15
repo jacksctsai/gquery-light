@@ -1,5 +1,6 @@
 #include "gq/filter_gpu.hpp"
 #include "gq/pipeline_timing.hpp"
+#include "gq/timer.hpp"
 #include "nvtx_utils.h"
 
 #include <cuda_runtime.h>
@@ -13,6 +14,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace gq {
 
@@ -168,6 +170,43 @@ inline void memset_device(void* dst, int value, std::size_t bytes, cudaStream_t 
     } else {
         cuda_check(cudaMemset(dst, value, bytes), "cudaMemset");
     }
+}
+
+inline void compute_batch_plan(std::size_t num_rows, std::size_t batch_rows, std::size_t& effective_batch_rows,
+                               std::size_t& num_batches) {
+    if (batch_rows == 0 || batch_rows >= num_rows) {
+        effective_batch_rows = num_rows;
+        num_batches = 1;
+    } else {
+        effective_batch_rows = batch_rows;
+        num_batches = (num_rows + batch_rows - 1) / batch_rows;
+    }
+}
+
+inline void merge_partial_groupby_cpu(const std::vector<double>& partial_sums,
+                                      const std::vector<unsigned long long>& partial_counts, std::size_t num_batches,
+                                      std::size_t num_groups, GroupByGpuTable& out) {
+    out.sum.assign(num_groups, 0.0);
+    out.count.assign(num_groups, 0U);
+    for (std::size_t b = 0; b < num_batches; ++b) {
+        for (std::size_t g = 0; g < num_groups; ++g) {
+            const std::size_t idx = b * num_groups + g;
+            out.sum[g] += partial_sums[idx];
+            out.count[g] += static_cast<std::uint64_t>(partial_counts[idx]);
+        }
+    }
+}
+
+inline void add_pipeline_timing(PipelineTiming& dst, const PipelineTiming& src) {
+    dst.total_gpu_ms += src.total_gpu_ms;
+    dst.h2d_ms += src.h2d_ms;
+    dst.filter_kernel_ms += src.filter_kernel_ms;
+    dst.scan_kernel_ms += src.scan_kernel_ms;
+    dst.scatter_kernel_ms += src.scatter_kernel_ms;
+    dst.atomic_groupby_kernel_ms += src.atomic_groupby_kernel_ms;
+    dst.block_partial_reduce_kernel_ms += src.block_partial_reduce_kernel_ms;
+    dst.final_reduce_kernel_ms += src.final_reduce_kernel_ms;
+    dst.d2h_ms += src.d2h_ms;
 }
 
 __global__ void filter_groupby_atomic_naive_kernel(const float* trip_distance, const float* fare_amount,
@@ -644,7 +683,7 @@ Result filter_and_sum_gpu_compact_block_partial(const Columns& columns, int iter
 GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int iterations, FilterGpuMetrics& metrics,
                                                    std::size_t num_groups, int threads_per_block,
                                                    const char* nvtx_iteration_prefix, TimingStats* measured_timing,
-                                                   ExecutionMode execution) {
+                                                   ExecutionMode execution, std::size_t batch_rows) {
     if (iterations < 1) {
         throw std::runtime_error("iterations must be >= 1");
     }
@@ -662,9 +701,11 @@ GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int i
     }
 
     const std::size_t n = columns.trip_distance.size();
-    const std::size_t bytes_float_col = n * sizeof(float);
-    const std::size_t bytes_pc = n * sizeof(std::uint32_t);
-    const std::size_t payload_bytes = 2U * bytes_float_col + bytes_pc;
+    std::size_t effective_batch_rows = 0;
+    std::size_t num_batches = 0;
+    compute_batch_plan(n, batch_rows, effective_batch_rows, num_batches);
+    const std::size_t max_batch_rows = effective_batch_rows;
+    const std::size_t payload_bytes = n * (2U * sizeof(float) + sizeof(std::uint32_t));
 
     metrics = FilterGpuMetrics{};
     GroupByGpuTable last{};
@@ -684,9 +725,10 @@ GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int i
 
     {
         NvtxRange alloc_range("cuda_allocation");
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_trip), bytes_float_col), "cudaMalloc d_trip");
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_fare), bytes_float_col), "cudaMalloc d_fare");
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_pc), bytes_pc), "cudaMalloc d_pc");
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_trip), max_batch_rows * sizeof(float)), "cudaMalloc d_trip");
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_fare), max_batch_rows * sizeof(float)), "cudaMalloc d_fare");
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_pc), max_batch_rows * sizeof(std::uint32_t)),
+                   "cudaMalloc d_pc");
         cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_group_sum),
                               static_cast<std::size_t>(num_groups) * sizeof(double)),
                    "cudaMalloc d_group_sum");
@@ -720,9 +762,9 @@ GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int i
     double acc_total = 0.0;
 
     const int threads = threads_per_block;
-    const int blocks = static_cast<int>((n + static_cast<std::size_t>(threads) - 1U) /
-                                        static_cast<std::size_t>(threads));
 
+    std::vector<double> partial_sums(num_batches * num_groups);
+    std::vector<unsigned long long> partial_counts(num_batches * num_groups);
     std::uint64_t selected_for_selectivity = 0;
     const char* iter_prefix = nvtx_iter_prefix_or_default(nvtx_iteration_prefix);
 
@@ -740,47 +782,77 @@ GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int i
 
     for (int it = 0; it < iterations; ++it) {
         NvtxRange iteration_range(iter_prefix, it);
-
-        memset_device(d_group_sum, 0, static_cast<std::size_t>(num_groups) * sizeof(double), stream);
-        memset_device(d_group_count, 0, static_cast<std::size_t>(num_groups) * sizeof(unsigned long long), stream);
-        memset_device(d_pred_match, 0, sizeof(unsigned long long), stream);
-
-        event_record(total_start, stream);
-
-        event_record(h2d_start, stream);
-        {
-            NvtxRange h2d_range("h2d_transfer");
-            memcpy_h2d(d_trip, columns.trip_distance.data(), bytes_float_col, stream);
-            memcpy_h2d(d_fare, columns.fare_amount.data(), bytes_float_col, stream);
-            memcpy_h2d(d_pc, columns.passenger_count.data(), bytes_pc, stream);
-        }
-        event_record(h2d_stop, stream);
-
-        event_record(atomic_start, stream);
-        {
-            NvtxRange kernel_range("atomic_groupby_sum_kernel_launch");
-            filter_groupby_atomic_naive_kernel<<<blocks, threads, 0, stream>>>(
-                d_trip, d_fare, d_pc, n, d_group_sum, d_group_count, d_pred_match,
-                static_cast<std::uint32_t>(num_groups));
-            cuda_check(cudaGetLastError(), "filter_groupby_atomic_naive_kernel launch");
-        }
-        event_record(atomic_stop, stream);
-
-        event_record(d2h_start, stream);
-        {
-            NvtxRange d2h_range("d2h_transfer");
-            memcpy_d2h(last.sum.data(), d_group_sum, static_cast<std::size_t>(num_groups) * sizeof(double), stream);
-            memcpy_d2h(last.count.data(), d_group_count,
-                       static_cast<std::size_t>(num_groups) * sizeof(unsigned long long), stream);
-            memcpy_d2h(&selected_for_selectivity, d_pred_match, sizeof(unsigned long long), stream);
-        }
-        event_record(d2h_stop, stream);
-
-        event_record(total_stop, stream);
-
         PipelineTiming iter_timing{};
-        record_pipeline_timing_atomic(total_start, total_stop, h2d_start, h2d_stop, atomic_start, atomic_stop, d2h_start,
-                                      d2h_stop, iter_timing, stream);
+        std::uint64_t iter_selected = 0;
+
+        {
+            NvtxRange batched_range("batched_pipeline");
+            for (std::size_t batch_id = 0; batch_id < num_batches; ++batch_id) {
+                NvtxRange batch_range("batch", static_cast<int>(batch_id));
+                const std::size_t batch_start = batch_id * effective_batch_rows;
+                const std::size_t batch_count = std::min(effective_batch_rows, n - batch_start);
+                const int blocks = static_cast<int>((batch_count + static_cast<std::size_t>(threads) - 1U) /
+                                                    static_cast<std::size_t>(threads));
+
+                memset_device(d_group_sum, 0, static_cast<std::size_t>(num_groups) * sizeof(double), stream);
+                memset_device(d_group_count, 0, static_cast<std::size_t>(num_groups) * sizeof(unsigned long long),
+                             stream);
+                memset_device(d_pred_match, 0, sizeof(unsigned long long), stream);
+
+                event_record(total_start, stream);
+
+                event_record(h2d_start, stream);
+                {
+                    NvtxRange h2d_range("h2d_transfer");
+                    memcpy_h2d(d_trip, columns.trip_distance.data() + batch_start, batch_count * sizeof(float),
+                               stream);
+                    memcpy_h2d(d_fare, columns.fare_amount.data() + batch_start, batch_count * sizeof(float), stream);
+                    memcpy_h2d(d_pc, columns.passenger_count.data() + batch_start, batch_count * sizeof(std::uint32_t),
+                               stream);
+                }
+                event_record(h2d_stop, stream);
+
+                event_record(atomic_start, stream);
+                {
+                    NvtxRange kernel_range("atomic_groupby_sum_kernel_launch");
+                    filter_groupby_atomic_naive_kernel<<<blocks, threads, 0, stream>>>(
+                        d_trip, d_fare, d_pc, batch_count, d_group_sum, d_group_count, d_pred_match,
+                        static_cast<std::uint32_t>(num_groups));
+                    cuda_check(cudaGetLastError(), "filter_groupby_atomic_naive_kernel launch");
+                }
+                event_record(atomic_stop, stream);
+
+                const std::size_t partial_offset = batch_id * num_groups;
+                unsigned long long batch_selected = 0;
+                event_record(d2h_start, stream);
+                {
+                    NvtxRange d2h_range("d2h_transfer");
+                    memcpy_d2h(partial_sums.data() + partial_offset, d_group_sum,
+                               static_cast<std::size_t>(num_groups) * sizeof(double), stream);
+                    memcpy_d2h(partial_counts.data() + partial_offset, d_group_count,
+                               static_cast<std::size_t>(num_groups) * sizeof(unsigned long long), stream);
+                    memcpy_d2h(&batch_selected, d_pred_match, sizeof(unsigned long long), stream);
+                }
+                event_record(d2h_stop, stream);
+
+                event_record(total_stop, stream);
+
+                PipelineTiming batch_timing{};
+                record_pipeline_timing_atomic(total_start, total_stop, h2d_start, h2d_stop, atomic_start, atomic_stop,
+                                              d2h_start, d2h_stop, batch_timing, stream);
+                add_pipeline_timing(iter_timing, batch_timing);
+                iter_selected += batch_selected;
+            }
+        }
+
+        {
+            NvtxRange merge_range("cpu_merge_partial_results");
+            CpuTimer merge_timer;
+            merge_partial_groupby_cpu(partial_sums, partial_counts, num_batches, num_groups, last);
+            iter_timing.cpu_merge_ms = merge_timer.elapsed_ms();
+        }
+
+        selected_for_selectivity = iter_selected;
         acc_h2d += iter_timing.h2d_ms;
         acc_groupby += iter_timing.atomic_groupby_kernel_ms;
         acc_d2h += iter_timing.d2h_ms;
@@ -840,7 +912,7 @@ GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int i
 GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns, int iterations, FilterGpuMetrics& metrics,
                                                          std::size_t num_groups, int threads_per_block,
                                                          const char* nvtx_iteration_prefix, TimingStats* measured_timing,
-                                                         ExecutionMode execution) {
+                                                         ExecutionMode execution, std::size_t batch_rows) {
     if (iterations < 1) {
         throw std::runtime_error("iterations must be >= 1");
     }
@@ -858,9 +930,11 @@ GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns,
     }
 
     const std::size_t n = columns.trip_distance.size();
-    const std::size_t bytes_float_col = n * sizeof(float);
-    const std::size_t bytes_pc = n * sizeof(std::uint32_t);
-    const std::size_t payload_bytes = 2U * bytes_float_col + bytes_pc;
+    std::size_t effective_batch_rows = 0;
+    std::size_t num_batches = 0;
+    compute_batch_plan(n, batch_rows, effective_batch_rows, num_batches);
+    const std::size_t max_batch_rows = effective_batch_rows;
+    const std::size_t payload_bytes = n * (2U * sizeof(float) + sizeof(std::uint32_t));
 
     metrics = FilterGpuMetrics{};
     GroupByGpuTable last{};
@@ -884,14 +958,17 @@ GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns,
 
     {
         NvtxRange alloc_range("cuda_allocation");
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_trip), bytes_float_col), "cudaMalloc d_trip");
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_fare), bytes_float_col), "cudaMalloc d_fare");
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_pc), bytes_pc), "cudaMalloc d_pc");
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_mask), n * sizeof(std::uint8_t)), "cudaMalloc d_mask");
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_mask_u64), n * sizeof(std::uint64_t)),
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_trip), max_batch_rows * sizeof(float)), "cudaMalloc d_trip");
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_fare), max_batch_rows * sizeof(float)), "cudaMalloc d_fare");
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_pc), max_batch_rows * sizeof(std::uint32_t)),
+                   "cudaMalloc d_pc");
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_mask), max_batch_rows * sizeof(std::uint8_t)),
+                   "cudaMalloc d_mask");
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_mask_u64), max_batch_rows * sizeof(std::uint64_t)),
                    "cudaMalloc d_mask_u64");
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_offsets), n * sizeof(std::uint64_t)), "cudaMalloc d_offsets");
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_selected_indices), n * sizeof(std::uint32_t)),
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_offsets), max_batch_rows * sizeof(std::uint64_t)),
+                   "cudaMalloc d_offsets");
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_selected_indices), max_batch_rows * sizeof(std::uint32_t)),
                    "cudaMalloc d_selected_indices");
         cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_selected_count), sizeof(unsigned long long)),
                    "cudaMalloc d_selected_count");
@@ -904,9 +981,6 @@ GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns,
     }
 
     const int threads = threads_per_block;
-    const int blocks = static_cast<int>((n + static_cast<std::size_t>(threads) - 1U) /
-                                        static_cast<std::size_t>(threads));
-    const int reduce_blocks = compute_blocks(n, threads);
 
     cudaEvent_t total_start{};
     cudaEvent_t total_stop{};
@@ -945,6 +1019,8 @@ GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns,
     double acc_d2h = 0.0;
     double acc_total = 0.0;
 
+    std::vector<double> partial_sums(num_batches * num_groups);
+    std::vector<unsigned long long> partial_counts(num_batches * num_groups);
     unsigned long long last_selected = 0;
     const char* iter_prefix = nvtx_iter_prefix_or_default(nvtx_iteration_prefix);
 
@@ -962,76 +1038,117 @@ GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns,
 
     for (int it = 0; it < iterations; ++it) {
         NvtxRange iteration_range(iter_prefix, it);
-
-        memset_device(d_selected_count, 0, sizeof(unsigned long long), stream);
-        memset_device(d_group_sum, 0, static_cast<std::size_t>(num_groups) * sizeof(double), stream);
-        memset_device(d_group_count, 0, static_cast<std::size_t>(num_groups) * sizeof(unsigned long long), stream);
-
-        event_record(total_start, stream);
-
-        event_record(h2d_start, stream);
-        {
-            NvtxRange h2d_range("h2d_transfer");
-            memcpy_h2d(d_trip, columns.trip_distance.data(), bytes_float_col, stream);
-            memcpy_h2d(d_fare, columns.fare_amount.data(), bytes_float_col, stream);
-            memcpy_h2d(d_pc, columns.passenger_count.data(), bytes_pc, stream);
-        }
-        event_record(h2d_stop, stream);
-
-        event_record(filter_start, stream);
-        {
-            NvtxRange filter_range("filter_kernel_launch");
-            filter_mask_kernel<<<blocks, threads, 0, stream>>>(d_trip, d_fare, n, d_mask);
-            cuda_check(cudaGetLastError(), "filter_mask_kernel launch");
-        }
-        event_record(filter_stop, stream);
-
-        event_record(scan_start, stream);
-        mask_u8_to_u64_kernel<<<blocks, threads, 0, stream>>>(d_mask, d_mask_u64, n);
-        cuda_check(cudaGetLastError(), "mask_u8_to_u64_kernel launch");
-        if (stream != nullptr) {
-            thrust::exclusive_scan(thrust::cuda::par.on(stream), d_mask_u64, d_mask_u64 + n, d_offsets);
-        } else {
-            thrust::exclusive_scan(thrust::device, d_mask_u64, d_mask_u64 + n, d_offsets);
-        }
-        cuda_check(cudaGetLastError(), "thrust::exclusive_scan");
-        event_record(scan_stop, stream);
-
-        event_record(scatter_start, stream);
-        scatter_selected_indices_kernel<<<blocks, threads, 0, stream>>>(d_mask_u64, d_offsets, n, d_selected_indices);
-        cuda_check(cudaGetLastError(), "scatter_selected_indices_kernel launch");
-        write_selected_count_kernel<<<1, 1, 0, stream>>>(d_mask_u64, d_offsets, n, d_selected_count);
-        cuda_check(cudaGetLastError(), "write_selected_count_kernel launch");
-        event_record(scatter_stop, stream);
-
-        event_record(reduce_start, stream);
-        {
-            NvtxRange reduce_range("block_partial_reduce_kernel_launch");
-            const std::size_t shmem_bytes =
-                static_cast<std::size_t>(num_groups) * (sizeof(double) + sizeof(unsigned long long));
-            groupby_selected_block_partial_kernel<<<reduce_blocks, threads, shmem_bytes, stream>>>(
-                d_fare, d_pc, d_selected_indices, d_selected_count, d_group_sum, d_group_count,
-                static_cast<std::uint32_t>(num_groups));
-            cuda_check(cudaGetLastError(), "groupby_selected_block_partial_kernel launch");
-        }
-        event_record(reduce_stop, stream);
-
-        event_record(d2h_start, stream);
-        {
-            NvtxRange d2h_range("d2h_transfer");
-            memcpy_d2h(&last_selected, d_selected_count, sizeof(unsigned long long), stream);
-            memcpy_d2h(last.sum.data(), d_group_sum, static_cast<std::size_t>(num_groups) * sizeof(double), stream);
-            memcpy_d2h(last.count.data(), d_group_count,
-                       static_cast<std::size_t>(num_groups) * sizeof(unsigned long long), stream);
-        }
-        event_record(d2h_stop, stream);
-
-        event_record(total_stop, stream);
-
         PipelineTiming iter_timing{};
-        record_pipeline_timing_block_partial(total_start, total_stop, h2d_start, h2d_stop, filter_start, filter_stop,
-                                             scan_start, scan_stop, scatter_start, scatter_stop, reduce_start,
-                                             reduce_stop, d2h_start, d2h_stop, iter_timing, stream);
+        unsigned long long iter_selected = 0;
+
+        {
+            NvtxRange batched_range("batched_pipeline");
+            for (std::size_t batch_id = 0; batch_id < num_batches; ++batch_id) {
+                NvtxRange batch_range("batch", static_cast<int>(batch_id));
+                const std::size_t batch_start = batch_id * effective_batch_rows;
+                const std::size_t batch_count = std::min(effective_batch_rows, n - batch_start);
+                const int blocks = static_cast<int>((batch_count + static_cast<std::size_t>(threads) - 1U) /
+                                                    static_cast<std::size_t>(threads));
+                const int reduce_blocks = compute_blocks(batch_count, threads);
+
+                memset_device(d_selected_count, 0, sizeof(unsigned long long), stream);
+                memset_device(d_group_sum, 0, static_cast<std::size_t>(num_groups) * sizeof(double), stream);
+                memset_device(d_group_count, 0, static_cast<std::size_t>(num_groups) * sizeof(unsigned long long),
+                             stream);
+
+                event_record(total_start, stream);
+
+                event_record(h2d_start, stream);
+                {
+                    NvtxRange h2d_range("h2d_transfer");
+                    memcpy_h2d(d_trip, columns.trip_distance.data() + batch_start, batch_count * sizeof(float),
+                               stream);
+                    memcpy_h2d(d_fare, columns.fare_amount.data() + batch_start, batch_count * sizeof(float), stream);
+                    memcpy_h2d(d_pc, columns.passenger_count.data() + batch_start, batch_count * sizeof(std::uint32_t),
+                               stream);
+                }
+                event_record(h2d_stop, stream);
+
+                event_record(filter_start, stream);
+                {
+                    NvtxRange filter_range("filter_kernel_launch");
+                    filter_mask_kernel<<<blocks, threads, 0, stream>>>(d_trip, d_fare, batch_count, d_mask);
+                    cuda_check(cudaGetLastError(), "filter_mask_kernel launch");
+                }
+                event_record(filter_stop, stream);
+
+                event_record(scan_start, stream);
+                {
+                    NvtxRange scan_range("scan_kernel_launch");
+                    mask_u8_to_u64_kernel<<<blocks, threads, 0, stream>>>(d_mask, d_mask_u64, batch_count);
+                    cuda_check(cudaGetLastError(), "mask_u8_to_u64_kernel launch");
+                    if (stream != nullptr) {
+                        thrust::exclusive_scan(thrust::cuda::par.on(stream), d_mask_u64, d_mask_u64 + batch_count,
+                                               d_offsets);
+                    } else {
+                        thrust::exclusive_scan(thrust::device, d_mask_u64, d_mask_u64 + batch_count, d_offsets);
+                    }
+                    cuda_check(cudaGetLastError(), "thrust::exclusive_scan");
+                }
+                event_record(scan_stop, stream);
+
+                event_record(scatter_start, stream);
+                {
+                    NvtxRange scatter_range("scatter_kernel_launch");
+                    scatter_selected_indices_kernel<<<blocks, threads, 0, stream>>>(d_mask_u64, d_offsets, batch_count,
+                                                                                    d_selected_indices);
+                    cuda_check(cudaGetLastError(), "scatter_selected_indices_kernel launch");
+                    write_selected_count_kernel<<<1, 1, 0, stream>>>(d_mask_u64, d_offsets, batch_count,
+                                                                     d_selected_count);
+                    cuda_check(cudaGetLastError(), "write_selected_count_kernel launch");
+                }
+                event_record(scatter_stop, stream);
+
+                event_record(reduce_start, stream);
+                {
+                    NvtxRange reduce_range("block_partial_reduce_kernel_launch");
+                    const std::size_t shmem_bytes =
+                        static_cast<std::size_t>(num_groups) * (sizeof(double) + sizeof(unsigned long long));
+                    groupby_selected_block_partial_kernel<<<reduce_blocks, threads, shmem_bytes, stream>>>(
+                        d_fare, d_pc, d_selected_indices, d_selected_count, d_group_sum, d_group_count,
+                        static_cast<std::uint32_t>(num_groups));
+                    cuda_check(cudaGetLastError(), "groupby_selected_block_partial_kernel launch");
+                }
+                event_record(reduce_stop, stream);
+
+                const std::size_t partial_offset = batch_id * num_groups;
+                unsigned long long batch_selected = 0;
+                event_record(d2h_start, stream);
+                {
+                    NvtxRange d2h_range("d2h_transfer");
+                    memcpy_d2h(&batch_selected, d_selected_count, sizeof(unsigned long long), stream);
+                    memcpy_d2h(partial_sums.data() + partial_offset, d_group_sum,
+                               static_cast<std::size_t>(num_groups) * sizeof(double), stream);
+                    memcpy_d2h(partial_counts.data() + partial_offset, d_group_count,
+                               static_cast<std::size_t>(num_groups) * sizeof(unsigned long long), stream);
+                }
+                event_record(d2h_stop, stream);
+
+                event_record(total_stop, stream);
+
+                PipelineTiming batch_timing{};
+                record_pipeline_timing_block_partial(total_start, total_stop, h2d_start, h2d_stop, filter_start,
+                                                     filter_stop, scan_start, scan_stop, scatter_start, scatter_stop,
+                                                     reduce_start, reduce_stop, d2h_start, d2h_stop, batch_timing,
+                                                     stream);
+                add_pipeline_timing(iter_timing, batch_timing);
+                iter_selected += batch_selected;
+            }
+        }
+
+        {
+            NvtxRange merge_range("cpu_merge_partial_results");
+            CpuTimer merge_timer;
+            merge_partial_groupby_cpu(partial_sums, partial_counts, num_batches, num_groups, last);
+            iter_timing.cpu_merge_ms = merge_timer.elapsed_ms();
+        }
+
+        last_selected = iter_selected;
         acc_h2d += iter_timing.h2d_ms;
         acc_filter += iter_timing.filter_kernel_ms;
         acc_scan += iter_timing.scan_kernel_ms;

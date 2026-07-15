@@ -17,6 +17,8 @@ struct PipelineTiming {
     double block_partial_reduce_kernel_ms{0.0};
     double final_reduce_kernel_ms{0.0};
     double d2h_ms{0.0};
+    /** Host-side merge of per-batch partial GROUP BY results (not GPU time). */
+    double cpu_merge_ms{0.0};
 };
 
 /** Aggregated averages over measured benchmark iterations (warmup excluded by caller). */
@@ -32,6 +34,7 @@ struct TimingStats {
     double block_partial_reduce_kernel_ms{0.0};
     double final_reduce_kernel_ms{0.0};
     double d2h_ms{0.0};
+    double cpu_merge_ms{0.0};
 
     void add(const PipelineTiming& t) {
         ++count;
@@ -44,6 +47,7 @@ struct TimingStats {
         block_partial_reduce_kernel_ms += t.block_partial_reduce_kernel_ms;
         final_reduce_kernel_ms += t.final_reduce_kernel_ms;
         d2h_ms += t.d2h_ms;
+        cpu_merge_ms += t.cpu_merge_ms;
     }
 
     double avg(double sum) const {
@@ -59,6 +63,7 @@ struct TimingStats {
     double avg_block_partial_reduce_kernel_ms() const { return avg(block_partial_reduce_kernel_ms); }
     double avg_final_reduce_kernel_ms() const { return avg(final_reduce_kernel_ms); }
     double avg_d2h_ms() const { return avg(d2h_ms); }
+    double avg_cpu_merge_ms() const { return avg(cpu_merge_ms); }
 };
 
 enum class PipelineTimingMode { Atomic, BlockPartial };
@@ -82,6 +87,7 @@ inline void print_pipeline_timing_summary(const TimingStats& stats, PipelineTimi
     }
 
     std::cout << "avg_d2h_ms: " << stats.avg_d2h_ms() << "\n";
+    std::cout << "avg_cpu_merge_ms: " << stats.avg_cpu_merge_ms() << "\n";
 }
 
 } // namespace gq
