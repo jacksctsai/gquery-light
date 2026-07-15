@@ -67,7 +67,7 @@ GroupByGpuTable filter_groupby_gpu_atomic_baseline(const Columns& columns, int i
                                                   const char* nvtx_iteration_prefix = nullptr,
                                                   TimingStats* measured_timing = nullptr,
                                                   ExecutionMode execution = ExecutionMode::Sync,
-                                                  std::size_t batch_rows = 0);
+                                                  std::size_t batch_rows = 0, int num_streams = 1);
 
 /**
  * Filter + compact + block-local partial GROUP BY with a final global merge (atomics on key slots).
@@ -77,6 +77,6 @@ GroupByGpuTable filter_groupby_gpu_compact_block_partial(const Columns& columns,
                                                          const char* nvtx_iteration_prefix = nullptr,
                                                          TimingStats* measured_timing = nullptr,
                                                          ExecutionMode execution = ExecutionMode::Sync,
-                                                         std::size_t batch_rows = 0);
+                                                         std::size_t batch_rows = 0, int num_streams = 1);
 
 } // namespace gq

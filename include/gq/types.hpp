@@ -29,7 +29,8 @@ enum class HostMemoryMode {
 
 enum class ExecutionMode {
     Sync,
-    SingleStreamAsync
+    SingleStreamAsync,
+    MultiStreamBatched
 };
 
 #ifdef GQUERY_USE_CUDA
